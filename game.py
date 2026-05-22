@@ -1395,14 +1395,11 @@ class SoundManager:
 
     def __init__(self):
         self._sounds: dict = {}
-        self._ambient      = None
         try:
             import numpy as _np
             self._build(_np)
         except Exception:
             pass   # no numpy or mixer not ready → stay silent
-
-    # ── helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _to_sound(arr, np) -> pygame.mixer.Sound:
@@ -1411,7 +1408,7 @@ class SoundManager:
         return pygame.sndarray.make_sound(np.column_stack([buf, buf]))
 
     def _build(self, np):
-        SR  = self._SR
+        SR = self._SR
 
         def t(dur):
             return np.linspace(0, dur, int(dur * SR), endpoint=False)
@@ -1419,98 +1416,70 @@ class SoundManager:
         def dec(time, tau):
             return np.exp(-time / tau)
 
-        mk = lambda arr, vol=0.6: (lambda s: (s.set_volume(vol), s)[1])(
-                 self._to_sound(arr, np))
+        def mk(arr, vol=0.22):
+            s = self._to_sound(arr, np)
+            s.set_volume(vol)
+            return s
 
-        # move — low thud 80 Hz, 0.10 s
-        _t = t(0.10)
-        rng = np.random.RandomState(1)
-        sig = np.sin(2*np.pi*80*_t) * dec(_t, 0.025)
-        sig += rng.randn(len(_t)) * 0.20 * dec(_t, 0.015)
-        self._sounds['move'] = mk(sig)
+        # move — soft muted footstep: gentle 100 Hz thud, 0.12 s
+        _t = t(0.12)
+        sig = np.sin(2*np.pi*100*_t) * dec(_t, 0.035)
+        sig += np.random.RandomState(1).randn(len(_t)) * 0.06 * dec(_t, 0.018)
+        self._sounds['move'] = mk(sig, vol=0.18)
 
-        # turn — swish: descending sweep 320→90 Hz, 0.08 s
-        _t = t(0.08)
-        freq = np.linspace(320, 90, len(_t))
+        # turn — soft cloth swish: low-amplitude noise burst, 0.07 s
+        _t = t(0.07)
+        freq = np.linspace(260, 110, len(_t))
         phase = np.cumsum(2*np.pi * freq / SR)
-        sig  = np.sin(phase) * dec(_t, 0.04) * 0.35
-        sig += np.random.RandomState(2).randn(len(_t)) * 0.15 * dec(_t, 0.03)
-        self._sounds['turn'] = mk(sig)
+        sig = np.sin(phase) * dec(_t, 0.035) * 0.25
+        sig += np.random.RandomState(2).randn(len(_t)) * 0.08 * dec(_t, 0.025)
+        self._sounds['turn'] = mk(sig, vol=0.14)
 
-        # plant — earth pat, mid 180 Hz, 0.15 s
-        _t = t(0.15)
-        sig  = np.sin(2*np.pi*180*_t) * dec(_t, 0.04)
-        sig += np.sin(2*np.pi*90*_t)  * dec(_t, 0.06) * 0.50
-        sig += np.random.RandomState(3).randn(len(_t)) * 0.35 * dec(_t, 0.03)
-        self._sounds['plant'] = mk(sig)
+        # plant — gentle earth pat: soft warm thud, 0.14 s
+        _t = t(0.14)
+        sig  = np.sin(2*np.pi*140*_t) * dec(_t, 0.045) * 0.60
+        sig += np.sin(2*np.pi*70*_t)  * dec(_t, 0.060) * 0.35
+        sig += np.random.RandomState(3).randn(len(_t)) * 0.08 * dec(_t, 0.020)
+        self._sounds['plant'] = mk(sig, vol=0.20)
 
-        # harvest — warm bell 880 Hz, 0.30 s
-        _t = t(0.30)
-        sig = (np.sin(2*np.pi*880*_t)        * 0.55 +
-               np.sin(2*np.pi*880*2.756*_t)  * 0.20 +
-               np.sin(2*np.pi*880*5.404*_t)  * 0.10) * dec(_t, 0.10)
-        self._sounds['harvest'] = mk(sig)
+        # harvest — soft warm bell: pure 660 Hz, long gentle fade, 0.45 s
+        _t = t(0.45)
+        sig = (np.sin(2*np.pi*660*_t) * 0.70 +
+               np.sin(2*np.pi*660*2.0*_t) * 0.15 +
+               np.sin(2*np.pi*660*3.0*_t) * 0.06) * dec(_t, 0.18)
+        self._sounds['harvest'] = mk(sig, vol=0.24)
 
-        # wait — barely audible tick, 0.05 s
+        # wait — barely-there soft tick, 0.05 s
         _t = t(0.05)
-        sig = np.random.RandomState(4).randn(len(_t)) * dec(_t, 0.008) * 0.70
-        self._sounds['wait'] = mk(sig, vol=0.18)
+        sig = np.sin(2*np.pi*200*_t) * dec(_t, 0.010) * 0.40
+        self._sounds['wait'] = mk(sig, vol=0.08)
 
-        # bump — dull thud 55 Hz, 0.10 s
-        _t = t(0.10)
-        sig  = np.sin(2*np.pi*55*_t) * dec(_t, 0.030)
-        sig += np.random.RandomState(5).randn(len(_t)) * 0.45 * dec(_t, 0.025)
-        self._sounds['bump'] = mk(sig)
+        # bump — very soft low thud (quieter than move), 0.09 s
+        _t = t(0.09)
+        sig  = np.sin(2*np.pi*70*_t) * dec(_t, 0.028) * 0.55
+        sig += np.random.RandomState(5).randn(len(_t)) * 0.07 * dec(_t, 0.018)
+        self._sounds['bump'] = mk(sig, vol=0.15)
 
-        # shop_open — wooden creak, 0.30 s
-        _t = t(0.30)
-        freq = np.linspace(380, 80, len(_t))
+        # shop_open — gentle soft pop/click, 0.18 s
+        _t = t(0.18)
+        freq = np.linspace(300, 120, len(_t))
         phase = np.cumsum(2*np.pi * freq / SR)
-        sig  = np.sin(phase) * dec(_t, 0.18) * 0.40
-        sig += np.sin(2*np.pi*160*_t + np.sin(2*np.pi*6*_t)*3) * dec(_t, 0.20) * 0.30
-        sig += np.random.RandomState(6).randn(len(_t)) * 0.15 * dec(_t, 0.25)
-        self._sounds['shop_open'] = mk(sig)
+        sig = np.sin(phase) * dec(_t, 0.08) * 0.45
+        sig += np.random.RandomState(6).randn(len(_t)) * 0.05 * dec(_t, 0.04)
+        self._sounds['shop_open'] = mk(sig, vol=0.18)
 
-        # purchase — coin clink 1320 Hz, 0.20 s
-        _t = t(0.20)
-        sig = (np.sin(2*np.pi*1320*_t) * 0.50 +
-               np.sin(2*np.pi*1760*_t) * 0.25 +
-               np.sin(2*np.pi*990*_t)  * 0.20) * dec(_t, 0.07)
-        self._sounds['purchase'] = mk(sig)
+        # purchase — soft gentle chime: 880 Hz, clean, 0.30 s
+        _t = t(0.30)
+        sig = (np.sin(2*np.pi*880*_t) * 0.65 +
+               np.sin(2*np.pi*1320*_t) * 0.20 +
+               np.sin(2*np.pi*660*_t)  * 0.12) * dec(_t, 0.12)
+        self._sounds['purchase'] = mk(sig, vol=0.22)
 
-        # fail — low refusal thud 48 Hz, 0.10 s
-        _t = t(0.10)
-        sig  = np.sin(2*np.pi*48*_t) * dec(_t, 0.035)
-        sig += np.sin(2*np.pi*96*_t) * dec(_t, 0.025) * 0.40
-        sig += np.random.RandomState(7).randn(len(_t)) * 0.20 * dec(_t, 0.02)
-        self._sounds['fail'] = mk(sig)
-
-        # ambient — looping wind + bird chirps, 4.0 s
-        dur_a = 4.0
-        n_a   = int(dur_a * SR)
-        ta    = np.linspace(0, dur_a, n_a, endpoint=False)
-        rng_a = np.random.RandomState(42)
-        noise = rng_a.randn(n_a)
-        k     = 80    # rough low-pass window
-        cs    = np.cumsum(np.insert(noise, 0, 0.0))
-        _w    = (cs[k:] - cs[:-k]) / k
-        wind  = np.zeros(n_a);  wind[:len(_w)] = _w
-        wind *= (0.55 + 0.45 * np.sin(2*np.pi*0.22*ta)) * 0.40
-        chirp = np.zeros(n_a)
-        for ct, f0, f1 in [(0.7, 2000, 2600), (2.1, 1800, 2400), (3.3, 2100, 2800)]:
-            s0 = int(ct * SR);  nc = int(0.07 * SR)
-            if s0 + nc <= n_a:
-                tc = np.linspace(0, 0.07, nc, endpoint=False)
-                fq = np.linspace(f0, f1, nc)
-                ph = np.cumsum(2*np.pi * fq / SR)
-                chirp[s0:s0+nc] = np.sin(ph) * np.exp(-tc / 0.022) * 0.70
-        sig_a  = wind + chirp * 0.35
-        fade_n = int(0.05 * SR)
-        sig_a[:fade_n]  *= np.linspace(0, 1, fade_n)
-        sig_a[-fade_n:] *= np.linspace(1, 0, fade_n)
-        self._ambient = self._to_sound(sig_a * 0.30, np)
-
-    # ── public API ────────────────────────────────────────────────────────────
+        # fail — very soft low bump, 0.08 s
+        _t = t(0.08)
+        sig  = np.sin(2*np.pi*60*_t) * dec(_t, 0.030) * 0.50
+        sig += np.sin(2*np.pi*90*_t) * dec(_t, 0.022) * 0.25
+        self._sounds['fail'] = mk(sig, vol=0.14)
 
     def play(self, name: str):
         snd = self._sounds.get(name)
@@ -1530,11 +1499,6 @@ class SoundManager:
         elif verb == 'wait':
             self.play('wait')
 
-    def start_ambient(self):
-        if self._ambient:
-            self._ambient.set_volume(0.20)
-            self._ambient.play(-1)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main loop
@@ -1549,7 +1513,6 @@ def main():
     state     = GameState()
     renderer  = Renderer(screen)
     sound_mgr = SoundManager()
-    sound_mgr.start_ambient()
 
     RIGHT_X      = PANEL_W + 20
     editor_rect  = pygame.Rect(RIGHT_X, 40, PANEL_W - 40, 296)
