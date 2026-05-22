@@ -13,9 +13,12 @@ WIN_W, WIN_H    = 1100, 700
 PANEL_W         = 550
 TILE_SIZE       = 110
 
-# Animation tuning (unchanged)
-MOVE_SPEED      = TILE_SIZE / 0.32
-PAUSE_DURATION  = 0.18
+# Animation timing
+MOVE_DURATION  = 0.35   # s per tile
+TURN_DURATION  = 0.20   # s for turn arc
+BUMP_DURATION  = 0.22   # s for invalid-move bump
+PAUSE_DURATION = 0.15   # s for plant / harvest / wait
+BUMP_DIST      = 18     # px offset during bump
 
 CURSOR_BLINK_MS = 530
 
@@ -152,6 +155,14 @@ class Direction(Enum):
 
 DIR_ORDER = [Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP]
 
+def smoothstep(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+def dir_to_angle(d: Direction) -> float:
+    return {Direction.RIGHT: 0.0, Direction.DOWN: 90.0,
+            Direction.LEFT: 180.0, Direction.UP: 270.0}[d]
+
 @dataclass
 class Tile:
     state:     TileState = TileState.EMPTY
@@ -281,20 +292,28 @@ def tile_cost(tiles_purchased: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Robot:
-    row:       int       = 0
-    col:       int       = 0
-    direction: Direction = Direction.RIGHT
-    px:        float     = 0.0
-    py:        float     = 0.0
-    target_px: float     = 0.0
-    target_py: float     = 0.0
+    row:          int       = 0
+    col:          int       = 0
+    direction:    Direction = Direction.RIGHT
+    px:           float     = 0.0
+    py:           float     = 0.0
+    target_px:    float     = 0.0
+    target_py:    float     = 0.0
+    start_px:     float     = 0.0
+    start_py:     float     = 0.0
+    visual_angle: float     = 0.0   # degrees: 0=right 90=down 180=left 270=up
+    start_angle:  float     = 0.0
+    target_angle: float     = 0.0
 
     def snap_to(self, grid: Grid):
         cx, cy = grid.tile_center(self.row, self.col)
-        self.px = self.target_px = float(cx)
-        self.py = self.target_py = float(cy)
+        self.px = self.target_px = self.start_px = float(cx)
+        self.py = self.target_py = self.start_py = float(cy)
+        self.visual_angle = dir_to_angle(self.direction)
 
     def set_target(self, r: int, c: int, grid: Grid):
+        self.start_px = self.px
+        self.start_py = self.py
         cx, cy = grid.tile_center(r, c)
         self.target_px = float(cx)
         self.target_py = float(cy)
@@ -309,11 +328,14 @@ class GameState:
         self.robot.snap_to(self.grid)
         self.points = 0
         self.action_queue: deque = deque()  # tuples: ('move',), ('plant','carrot'), …
-        # execution state (animation system — unchanged)
-        self.running      = False
-        self.animating    = False
-        self.anim_is_move = False
-        self.anim_timer   = 0.0
+        # execution state
+        self.running       = False
+        self.animating     = False
+        self.anim_type     = 'none'   # 'move' | 'turn' | 'bump' | 'pause'
+        self.anim_elapsed  = 0.0
+        self.anim_duration = 0.0
+        self.anim_bump_dx  = 0.0
+        self.anim_bump_dy  = 0.0
         self.console_msgs: list = []
         # NEW: progression & shop state
         self.tiles_purchased = 0
@@ -326,11 +348,32 @@ class GameState:
         if len(self.console_msgs) > 60:
             self.console_msgs.pop(0)
 
+    def _start_anim(self, anim_type: str, duration: float):
+        self.animating     = True
+        self.anim_type     = anim_type
+        self.anim_elapsed  = 0.0
+        self.anim_duration = duration
+
     def _start_move(self):
-        self.animating = True;  self.anim_is_move = True
+        self._start_anim('move', MOVE_DURATION)
+
+    def _start_turn(self, new_dir: Direction):
+        from_a = self.robot.visual_angle
+        to_a   = dir_to_angle(new_dir)
+        delta  = (to_a - from_a + 180.0) % 360.0 - 180.0
+        self.robot.start_angle  = from_a
+        self.robot.target_angle = from_a + delta
+        self._start_anim('turn', TURN_DURATION)
+
+    def _start_bump(self, dr: int, dc: int):
+        self.robot.start_px = self.robot.px
+        self.robot.start_py = self.robot.py
+        self.anim_bump_dx   = float(dc) * BUMP_DIST
+        self.anim_bump_dy   = float(dr) * BUMP_DIST
+        self._start_anim('bump', BUMP_DURATION)
 
     def _start_pause(self):
-        self.animating = True;  self.anim_is_move = False;  self.anim_timer = 0.0
+        self._start_anim('pause', PAUSE_DURATION)
 
     def dispatch(self, action: tuple):
         verb = action[0]
@@ -343,10 +386,10 @@ class GameState:
             nr, nc = r + dr, c + dc
             if not grid.in_bounds(nr, nc):
                 self.log("move(): can't move there — tile not available.", C_CON_RED)
-                self._start_pause()
+                self._start_bump(dr, dc)
             elif grid.get(nr, nc).state == TileState.OBSTACLE:
                 self.log("move(): obstacle in the way.", C_CON_RED)
-                self._start_pause()
+                self._start_bump(dr, dc)
             else:
                 robot.row, robot.col = nr, nc
                 robot.set_target(nr, nc, grid)
@@ -355,13 +398,15 @@ class GameState:
 
         elif verb == 'turn_left':
             idx = DIR_ORDER.index(robot.direction)
-            robot.direction = DIR_ORDER[(idx - 1) % 4]
-            grid.tick();  self._start_pause()
+            new_dir = DIR_ORDER[(idx - 1) % 4]
+            robot.direction = new_dir
+            grid.tick();  self._start_turn(new_dir)
 
         elif verb == 'turn_right':
             idx = DIR_ORDER.index(robot.direction)
-            robot.direction = DIR_ORDER[(idx + 1) % 4]
-            grid.tick();  self._start_pause()
+            new_dir = DIR_ORDER[(idx + 1) % 4]
+            robot.direction = new_dir
+            grid.tick();  self._start_turn(new_dir)
 
         elif verb == 'plant':
             crop_name = action[1] if len(action) > 1 else 'carrot'
@@ -403,9 +448,10 @@ class GameState:
             d = dir_map.get(str(action[1]).lower())
             if d:
                 robot.direction = d
+                grid.tick();  self._start_turn(d)
             else:
                 self.log(f"face(): unknown direction '{action[1]}'", C_CON_RED)
-            grid.tick();  self._start_pause()
+                grid.tick();  self._start_pause()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sandbox executor
@@ -443,7 +489,10 @@ def build_sandbox(queue: deque, state: GameState) -> dict:
 
 def run_player_code(code: str, state: GameState):
     state.action_queue.clear()
-    state.animating = False
+    state.animating    = False
+    state.anim_type    = 'none'
+    state.anim_elapsed = 0.0
+    state.robot.snap_to(state.grid)
     sandbox = build_sandbox(state.action_queue, state)
     try:
         exec(compile(code, '<editor>', 'exec'), sandbox)
@@ -758,24 +807,27 @@ class Renderer:
 
     # ── robot (unchanged) ─────────────────────────────────────────────────────
 
-    def draw_robot(self, robot: Robot, anim_is_move: bool):
+    def draw_robot(self, robot: Robot, anim_type: str, t_raw: float):
         s = self.screen
-        cy_off = 0
-        if anim_is_move:
-            dist   = math.hypot(robot.target_px - robot.px, robot.target_py - robot.py)
-            prog   = max(0.0, 1.0 - dist / TILE_SIZE)
-            cy_off = int(-math.sin(prog * math.pi) * 5)
+        cy_off = int(-math.sin(t_raw * math.pi) * 5) if anim_type == 'move' else 0
         cx = int(robot.px);  cy = int(robot.py) + cy_off
         pygame.draw.rect(s, C_BOT_DARK, (cx - 13, cy - 13 + 4, 26, 26), border_radius=3)
         pygame.draw.rect(s, C_BOT_BODY, (cx - 13, cy - 13,     26, 26), border_radius=3)
         pygame.draw.rect(s, C_BOT_DARK, (cx + 10, cy - 13, 3, 26))
         pygame.draw.rect(s, C_BOT_DARK, (cx - 13, cy + 10, 26,  3))
-        d = robot.direction
-        if   d == Direction.RIGHT: fp=(cx+4,cy-7,9,14); e1=(cx+6,cy-4); e2=(cx+6,cy+2)
-        elif d == Direction.LEFT:  fp=(cx-13,cy-7,9,14);e1=(cx-10,cy-4);e2=(cx-10,cy+2)
-        elif d == Direction.DOWN:  fp=(cx-7,cy+4,14,9); e1=(cx-4,cy+6); e2=(cx+2,cy+6)
-        else:                      fp=(cx-7,cy-13,14,9);e1=(cx-4,cy-10);e2=(cx+2,cy-10)
-        pygame.draw.rect(s, C_BOT_FACE, fp)
+        # face panel + eyes computed from visual_angle for smooth rotation
+        ar   = math.radians(robot.visual_angle)
+        fr   = 9.0
+        fcx  = cx + math.cos(ar) * fr
+        fcy  = cy + math.sin(ar) * fr
+        abss = abs(math.sin(ar));  absc = abs(math.cos(ar))
+        fw   = round(9 * absc + 14 * abss)
+        fh   = round(14 * absc + 9 * abss)
+        pygame.draw.rect(s, C_BOT_FACE,
+                         (int(fcx - fw / 2), int(fcy - fh / 2), fw, fh))
+        px2 = -math.sin(ar);  py2 = math.cos(ar)   # perpendicular to face
+        e1  = (int(fcx - px2 * 3 - 1), int(fcy - py2 * 3 - 1))
+        e2  = (int(fcx + px2 * 3 - 1), int(fcy + py2 * 3 - 1))
         pygame.draw.rect(s, C_BOT_EYE, (*e1, 3, 3))
         pygame.draw.rect(s, C_BOT_EYE, (*e2, 3, 3))
         pygame.draw.rect(s, C_BOT_LED, (cx + 7, cy - 12, 4, 4))
@@ -1002,7 +1054,8 @@ class Renderer:
         for (r, c), tile in state.grid.tiles.items():
             self.draw_tile(tile, *state.grid.tile_px(r, c), r, c)
 
-        self.draw_robot(state.robot, state.anim_is_move and state.animating)
+        _t_raw = min(1.0, state.anim_elapsed / state.anim_duration) if (state.animating and state.anim_duration > 0) else 0.0
+        self.draw_robot(state.robot, state.anim_type if state.animating else 'none', _t_raw)
 
         # Title + points
         s.blit(self.font_big.render("Farm Bot", True, C_GOLD), (20, 14))
@@ -1106,22 +1159,30 @@ def main():
         # ── animation update (paused when shop is open) ──────────────────────
         robot = state.robot
         if not state.shop_open and state.running and state.animating:
-            if state.anim_is_move:
-                dx   = robot.target_px - robot.px
-                dy   = robot.target_py - robot.py
-                dist = math.hypot(dx, dy)
-                if dist > 0.5:
-                    step = min(dist, MOVE_SPEED * dt)
-                    robot.px += (dx / dist) * step
-                    robot.py += (dy / dist) * step
-                else:
+            state.anim_elapsed += dt
+            dur   = state.anim_duration if state.anim_duration > 0 else 1e-6
+            t_raw = min(1.0, state.anim_elapsed / dur)
+            t     = smoothstep(t_raw)
+            if state.anim_type == 'move':
+                robot.px = robot.start_px + (robot.target_px - robot.start_px) * t
+                robot.py = robot.start_py + (robot.target_py - robot.start_py) * t
+            elif state.anim_type == 'bump':
+                bump_t   = math.sin(t_raw * math.pi)
+                robot.px = robot.start_px + state.anim_bump_dx * bump_t
+                robot.py = robot.start_py + state.anim_bump_dy * bump_t
+            elif state.anim_type == 'turn':
+                delta = robot.target_angle - robot.start_angle
+                robot.visual_angle = robot.start_angle + delta * t
+            if t_raw >= 1.0:
+                if state.anim_type == 'move':
                     robot.px = robot.target_px
                     robot.py = robot.target_py
-                    state.animating = False
-            else:
-                state.anim_timer += dt
-                if state.anim_timer >= PAUSE_DURATION:
-                    state.animating = False
+                elif state.anim_type == 'bump':
+                    robot.px = robot.start_px
+                    robot.py = robot.start_py
+                elif state.anim_type == 'turn':
+                    robot.visual_angle = dir_to_angle(robot.direction)
+                state.animating = False
 
         # ── dispatch next action ─────────────────────────────────────────────
         if not state.shop_open and state.running and not state.animating:
