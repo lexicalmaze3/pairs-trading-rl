@@ -12,9 +12,9 @@ import pygame
 WIN_W, WIN_H    = 1100, 700
 PANEL_W         = 550
 
-ISO_HALF_W      = 64    # half-width of iso diamond (full face = 128 px)
-ISO_HALF_H      = 32    # half-height of iso diamond (full face = 64 px)
-BLOCK_H         = 14    # visible side-face height for 3D cube look
+TILE_W          = 88    # tile width in pixels
+TILE_H          = 66    # tile height (compressed ~75 % for slight-tilt look)
+TILE_DEPTH      = 5     # bottom-edge depth strip suggesting tilt
 
 # Animation timing
 MOVE_DURATION  = 0.35   # s per tile
@@ -191,27 +191,6 @@ def dir_to_angle(d: Direction) -> float:
     return {Direction.RIGHT: 0.0, Direction.DOWN: 90.0,
             Direction.LEFT: 180.0, Direction.UP: 270.0}[d]
 
-# Isometric geometry helpers – top vertex is the "north" point of the diamond
-def _iso_verts(sx: int, sy: int) -> list:
-    return [(sx, sy),
-            (sx + ISO_HALF_W, sy + ISO_HALF_H),
-            (sx, sy + ISO_HALF_H * 2),
-            (sx - ISO_HALF_W, sy + ISO_HALF_H)]
-
-def _iso_left_pts(sx: int, sy: int) -> list:
-    """Left (NW) side face of BLOCK_H-tall cube."""
-    return [(sx - ISO_HALF_W, sy + ISO_HALF_H),
-            (sx, sy + ISO_HALF_H * 2),
-            (sx, sy + ISO_HALF_H * 2 + BLOCK_H),
-            (sx - ISO_HALF_W, sy + ISO_HALF_H + BLOCK_H)]
-
-def _iso_right_pts(sx: int, sy: int) -> list:
-    """Right (SE) side face of BLOCK_H-tall cube."""
-    return [(sx, sy + ISO_HALF_H * 2),
-            (sx + ISO_HALF_W, sy + ISO_HALF_H),
-            (sx + ISO_HALF_W, sy + ISO_HALF_H + BLOCK_H),
-            (sx, sy + ISO_HALF_H * 2 + BLOCK_H)]
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Day / night colour helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,34 +297,27 @@ class Grid:
                 min(self.c_min, nc), max(self.c_max, nc))
 
     def tile_px(self, r: int, c: int) -> tuple:
-        """Top (north) vertex of tile's iso diamond in screen space."""
-        # Derive a stable origin so the visual centre of the grid is at PANEL_W/2
+        """Top-left corner of the tile's screen rectangle."""
         vr0, vr1, vc0, vc1 = self._vis_extent()
-        span_h = (vc1 - vc0 + vr1 - vr0 + 2) * ISO_HALF_H
-        top_m, bot_m = 92, 168
-        oy_base = top_m + max(0, (WIN_H - top_m - bot_m - span_h) // 2)
-        # ox is always the panel centre; oy_base is the y of tile(0,0) top vertex
-        return (PANEL_W // 2 + (c - r) * ISO_HALF_W,
-                oy_base + (c + r) * ISO_HALF_H)
+        n_cols = vc1 - vc0 + 1
+        n_rows = vr1 - vr0 + 1
+        ox = PANEL_W // 2 - (n_cols * TILE_W) // 2 - vc0 * TILE_W
+        top_m, bot_m = 90, 130
+        oy = top_m + max(0, (WIN_H - top_m - bot_m - n_rows * TILE_H) // 2) - vr0 * TILE_H
+        return ox + c * TILE_W, oy + r * TILE_H
 
     def tile_center(self, r: int, c: int) -> tuple:
-        """Centre of the iso top face (robot anchor point)."""
+        """Centre of the tile's screen rectangle (robot anchor)."""
         sx, sy = self.tile_px(r, c)
-        return sx, sy + ISO_HALF_H
+        return sx + TILE_W // 2, sy + TILE_H // 2
 
     def visual_rect(self) -> pygame.Rect:
-        """Bounding rectangle of the full visible grid (used for background framing)."""
+        """Bounding rectangle of the full visible grid."""
         vr0, vr1, vc0, vc1 = self._vis_extent()
-        # corners of the diamond grid
-        top_sx, top_sy    = self.tile_px(vr0, vc0)
-        right_sx, right_sy = self.tile_px(vr0, vc1)
-        bot_sx,  bot_sy    = self.tile_px(vr1, vc1)
-        left_sx, left_sy   = self.tile_px(vr1, vc0)
-        lx = left_sx  - ISO_HALF_W - 8
-        rx = right_sx + ISO_HALF_W + 8
-        ty = top_sy               - 8
-        by = bot_sy   + ISO_HALF_H * 2 + BLOCK_H + 8
-        return pygame.Rect(lx, ty, rx - lx, by - ty)
+        sx, sy = self.tile_px(vr0, vc0)
+        w = (vc1 - vc0 + 1) * TILE_W
+        h = (vr1 - vr0 + 1) * TILE_H + TILE_DEPTH
+        return pygame.Rect(sx - 6, sy - 6, w + 12, h + 12)
 
     def locked_positions(self):
         """Yield all (r, c) within the visual extent that are not yet unlocked."""
@@ -776,291 +748,232 @@ class Renderer:
         self._sky_tod  = -1.0   # force redraw on first frame
         self._night_ov = pygame.Surface((PANEL_W, WIN_H), pygame.SRCALPHA)
 
-    # ── iso tile rendering ────────────────────────────────────────────────────
+    # ── top-down tile rendering ───────────────────────────────────────────────
 
-    def _get_iso_dots(self, r: int, c: int) -> list:
-        """Stable per-tile texture dots positioned within the diamond."""
+    def _get_tile_dots(self, r: int, c: int) -> list:
+        """Stable per-tile texture dots scattered within the rectangle."""
         if (r, c) in self._soil_dots:
             return self._soil_dots[(r, c)]
         dots = []
         h = r * 0x6B + c * 0xA3 + 0xFF
-        for _ in range(40):
+        for _ in range(60):
             h = (h * 0x41C6 + 0x3039) & 0xFFFF
-            dx = (h % (ISO_HALF_W * 2)) - ISO_HALF_W
+            dx = (h % (TILE_W - 8)) + 4
             h = (h * 0x41C6 + 0x3039) & 0xFFFF
-            dy = (h % (ISO_HALF_H * 2)) - ISO_HALF_H
-            # reject outside diamond (|dx|/IHW + |dy|/IHH > 0.72)
-            if abs(dx) / ISO_HALF_W + abs(dy) / ISO_HALF_H > 0.72:
-                continue
+            dy = (h % (TILE_H - 8)) + 4
             h = (h * 0x41C6 + 0x3039) & 0xFFFF
             col = C_SOIL_LT if h % 3 != 0 else C_SOIL_DK
             dots.append((dx, dy, col))
-            if len(dots) >= 8:
+            if len(dots) >= 10:
                 break
         self._soil_dots[(r, c)] = dots
         return dots
 
-    def _draw_iso_cube(self, sx: int, sy: int,
-                       top_c, left_c, right_c, edge_c=None):
-        """Draw a flat iso cube block with three visible faces."""
-        s = self.screen
-        pygame.draw.polygon(s, right_c, _iso_right_pts(sx, sy))
-        pygame.draw.polygon(s, left_c,  _iso_left_pts(sx, sy))
-        pygame.draw.polygon(s, top_c,   _iso_verts(sx, sy))
-        # Crisp outline on top face only
-        ec = edge_c or C_TILE_BDR
-        pygame.draw.polygon(s, ec, _iso_verts(sx, sy), 1)
-
-    def _draw_iso_sprout(self, sx: int, sy: int, tile):
-        """Small plant above the tile surface during growth."""
+    def _draw_sprout(self, sx: int, sy: int, tile):
+        """Growing plant seen from slightly-tilted top-down."""
         s  = self.screen
-        cx = sx;  cy = sy + ISO_HALF_H   # tile face centre
+        cx = sx + TILE_W // 2
+        cy = sy + TILE_H // 2 - 4
         crop = CROPS.get(tile.crop_type, CROPS['carrot'])
         prog = max(0.0, 1.0 - tile.growth_turns / max(1, crop.turns))
-        ht   = int(10 + prog * 22)
-        # Shadow ellipse
-        pygame.draw.ellipse(s, C_ISO_SHADOW, (cx - 10, cy - 3, 20, 7))
-        if tile.crop_type == 'wheat':
-            for ox in (-4, 0, 4):
-                pygame.draw.line(s, C_STEM, (cx+ox, cy), (cx+ox, cy-ht), 1)
-                pygame.draw.line(s, C_STEM_LT, (cx+ox+1, cy), (cx+ox+1, cy-ht+2), 1)
-            if prog > 0.3:
-                pygame.draw.ellipse(s, (118,158,56), (cx-9, cy-ht-2, 10, 5))
-                pygame.draw.ellipse(s, (118,158,56), (cx+1, cy-ht+1, 10, 5))
-        elif tile.crop_type == 'pumpkin':
-            pygame.draw.line(s, C_STEM_DK, (cx, cy), (cx, cy-ht), 2)
-            pygame.draw.line(s, C_STEM,    (cx+1, cy), (cx+1, cy-ht+2), 1)
-            if prog > 0.35:
-                pygame.draw.ellipse(s, C_PUMPKIN,    (cx-6, cy-ht-4, 13, 10))
-                pygame.draw.ellipse(s, C_PUMPKIN_LT, (cx-4, cy-ht-3,  5,  5))
-        else:  # carrot
-            pygame.draw.line(s, C_STEM, (cx, cy), (cx, cy-ht), 2)
-            pygame.draw.line(s, C_STEM_LT, (cx+1, cy), (cx+1, cy-ht+2), 1)
-            if prog > 0.3:
-                for ox, oy2 in ((-8, -4), (2, -2), (-6, -8)):
-                    pygame.draw.ellipse(s, C_LEAF,    (cx+ox, cy-ht+oy2, 10, 5))
-                    pygame.draw.ellipse(s, C_LEAF_DK, (cx+ox, cy-ht+oy2+3, 10, 3))
+        r_base = int(4 + prog * 9)   # radius grows with progress
 
-    def _draw_iso_crop(self, sx: int, sy: int, tile):
-        """Full mature crop above the tile surface."""
+        if tile.crop_type == 'wheat':
+            # Spreading cluster of tiny stalks viewed from above
+            for i, (dx, dy) in enumerate([(-5,0),(5,0),(0,-5),(0,5),(-4,-4),(4,-4)]):
+                if i / 6 > prog + 0.15: break
+                pygame.draw.circle(s, C_STEM_DK, (cx+dx, cy+dy), 2)
+                pygame.draw.circle(s, C_STEM_LT, (cx+dx, cy+dy), 1)
+        elif tile.crop_type == 'pumpkin':
+            # Small green shoot blob
+            pygame.draw.circle(s, C_STEM_DK, (cx, cy), r_base)
+            pygame.draw.circle(s, C_STEM,    (cx, cy), max(1, r_base - 2))
+        else:  # carrot
+            # Tuft of leaves viewed from above
+            for dx, dy in ((-3,-3),(3,-3),(0,4),(-4,1),(4,1)):
+                pygame.draw.ellipse(s, C_LEAF_DK, (cx+dx-3, cy+dy-2, 6, 4))
+            pygame.draw.circle(s, C_LEAF, (cx, cy), max(2, r_base - 3))
+
+    def _draw_crop(self, sx: int, sy: int, tile):
+        """Full mature crop viewed from slightly-tilted top-down."""
         s  = self.screen
-        cx = sx;  cy = sy + ISO_HALF_H
-        pygame.draw.ellipse(s, C_ISO_SHADOW, (cx - 14, cy - 4, 28, 9))
-        if tile.crop_type == 'wheat':
-            ht = 46
-            for ox in (-7, -3, 1, 5):
-                pygame.draw.line(s, C_STEM,    (cx+ox, cy), (cx+ox,   cy-ht), 1)
-                pygame.draw.line(s, C_STEM_LT, (cx+ox+1, cy), (cx+ox+1, cy-ht+4), 1)
-                # drooping head
-                pygame.draw.line(s, C_WHEAT, (cx+ox, cy-ht), (cx+ox+4, cy-ht+10), 2)
-                pygame.draw.ellipse(s, C_WHEAT,    (cx+ox+1, cy-ht+6, 6, 9))
-                pygame.draw.ellipse(s, C_WHEAT_LT, (cx+ox+2, cy-ht+7, 3, 5))
-            for ox in (-9, -5, -1, 3):
-                pygame.draw.ellipse(s, C_LEAF, (cx+ox, cy-ht//2-2, 9, 4))
-        elif tile.crop_type == 'pumpkin':
-            ht = 16
-            pygame.draw.line(s, C_STEM_DK, (cx, cy), (cx, cy-ht), 2)
-            pygame.draw.line(s, C_STEM,    (cx+1, cy), (cx+1, cy-ht), 1)
-            # Three pumpkin lobes side by side
-            for ox, ow in ((-14, 13), (-4, 15), (6, 13)):
-                pygame.draw.ellipse(s, C_PUMPKIN,    (cx+ox, cy-ht-16, ow, 18), border_radius=2)
-                pygame.draw.ellipse(s, C_PUMPKIN_LT, (cx+ox+2, cy-ht-14, ow//2, 7))
-            for ox in (-12, -2, 8):
-                pygame.draw.line(s, C_PUMPKIN_DK,
-                                 (cx+ox, cy-ht-1), (cx+ox, cy-ht-16), 1)
-            # Stem curls
-            pygame.draw.arc(s, C_STEM_DK,
-                            pygame.Rect(cx-4, cy-ht-22, 10, 8), 0, math.pi, 2)
-        else:  # carrot
-            ht = 40
-            pygame.draw.line(s, C_STEM,    (cx, cy), (cx,   cy-ht), 2)
-            pygame.draw.line(s, C_STEM_LT, (cx+1, cy), (cx+1, cy-ht+4), 1)
-            for i, (ox, oy2) in enumerate([(-10, -8), (3, -12), (-8, -20),
-                                           (2, -22), (-6, -30)]):
-                lc = C_LEAF if i % 2 == 0 else C_LEAF_DK
-                pygame.draw.ellipse(s, lc, (cx+ox, cy-ht+oy2, 12, 5))
-            # small orange tip hint
-            pygame.draw.ellipse(s, (200, 110, 50), (cx-3, cy-4, 6, 6))
-            pygame.draw.ellipse(s, (220, 140, 70), (cx-2, cy-3, 3, 3))
+        cx = sx + TILE_W // 2
+        cy = sy + TILE_H // 2 - 4
 
-    def _draw_iso_pips(self, sx: int, sy: int, tile):
-        """Growth progress indicators along the front edge of the tile."""
+        if tile.crop_type == 'wheat':
+            # Golden grain cluster — ring of oval heads around centre
+            for ang_deg in range(0, 360, 45):
+                ang = math.radians(ang_deg)
+                hx  = int(cx + math.cos(ang) * 9)
+                hy  = int(cy + math.sin(ang) * 7)
+                pygame.draw.ellipse(s, C_WHEAT,    (hx-4, hy-5, 8, 9))
+                pygame.draw.ellipse(s, C_WHEAT_LT, (hx-2, hy-3, 4, 5))
+                pygame.draw.line(s, C_STEM, (cx, cy), (hx, hy), 1)
+            pygame.draw.circle(s, C_STEM_LT, (cx, cy), 4)   # centre
+
+        elif tile.crop_type == 'pumpkin':
+            # Orange disc with 3 radial lobe lines and small stem
+            pygame.draw.circle(s, (160, 80, 20), (cx+2, cy+2), 16)   # shadow
+            pygame.draw.circle(s, C_PUMPKIN,     (cx,   cy),   15)
+            pygame.draw.circle(s, C_PUMPKIN_LT,  (cx-3, cy-3), 7)
+            for ang_deg in (30, 150, 270):
+                ang = math.radians(ang_deg)
+                pygame.draw.line(s, C_PUMPKIN_DK,
+                                 (cx, cy), (int(cx + math.cos(ang)*14), int(cy + math.sin(ang)*13)), 2)
+            pygame.draw.circle(s, C_STEM_DK, (cx, cy-14), 3)   # stem top
+
+        else:  # carrot — green leafy rosette
+            # Leaf rosette
+            for ang_deg in range(0, 360, 60):
+                ang = math.radians(ang_deg)
+                lx  = int(cx + math.cos(ang) * 10)
+                ly  = int(cy + math.sin(ang) *  8)
+                lc  = C_LEAF if ang_deg % 120 == 0 else C_LEAF_DK
+                pygame.draw.ellipse(s, lc, (lx-5, ly-4, 10, 8))
+            pygame.draw.circle(s, C_LEAF_DK, (cx, cy), 5)
+            pygame.draw.circle(s, (200, 110, 50), (cx, cy), 3)   # orange top hint
+
+    def _draw_pips(self, sx: int, sy: int, tile):
+        """Growth progress dots along the bottom edge of the tile."""
         crop_info = CROPS.get(tile.crop_type, CROPS['carrot'])
-        total     = max(1, crop_info.turns)
-        done      = total - tile.growth_turns
-        num       = min(total, 6)
-        cx = sx;  base_y = sy + ISO_HALF_H * 2 + 2
-        step = 8
+        total = max(1, crop_info.turns)
+        done  = total - tile.growth_turns
+        num   = min(total, 6)
+        step  = 8
+        bx0   = sx + TILE_W // 2 - (num * step) // 2
+        by    = sy + TILE_H - TILE_DEPTH - 6
         for i in range(num):
             filled = i < round(done / total * num)
             col    = C_STEM if filled else C_SOIL_DK
-            bx     = cx - (num * step) // 2 + i * step
-            pygame.draw.rect(self.screen, col, (bx, base_y, 5, 4))
+            pygame.draw.rect(self.screen, col, (bx0 + i * step, by, 5, 4))
 
-    def _draw_iso_locked(self, sx: int, sy: int):
-        """Locked / purchasable tile block."""
-        self._draw_iso_cube(sx, sy, C_ISO_LOCK_T, C_ISO_LOCK_L, C_ISO_LOCK_R, C_LOCKED_ICON)
-        cx = sx;  cy = sy + ISO_HALF_H
-        pygame.draw.rect(self.screen, C_LOCKED_ICON, (cx-6, cy, 12, 9),  border_radius=2)
-        pygame.draw.rect(self.screen, C_LOCKED_ICON, (cx-4, cy-7, 8, 8))
-        pygame.draw.rect(self.screen, C_ISO_LOCK_T,  (cx-2, cy-6, 4, 7))
-        pygame.draw.rect(self.screen, C_ISO_LOCK_T,  (cx-2, cy+2, 4, 4))
+    def _draw_locked(self, sx: int, sy: int):
+        """Locked / purchasable tile — top-down style."""
+        s  = self.screen
+        r  = pygame.Rect(sx, sy, TILE_W, TILE_H)
+        # Dark fill
+        pygame.draw.rect(s, C_ISO_LOCK_T, r)
+        pygame.draw.rect(s, C_ISO_LOCK_L, (sx, sy + TILE_H - TILE_DEPTH, TILE_W, TILE_DEPTH))
+        pygame.draw.rect(s, C_LOCKED_ICON, r, 1)
+        # Padlock icon centred on tile
+        cx = sx + TILE_W // 2;  cy = sy + TILE_H // 2
+        pygame.draw.rect(s, C_LOCKED_ICON, (cx-6, cy, 12, 9),  border_radius=2)
+        pygame.draw.rect(s, C_LOCKED_ICON, (cx-4, cy-7, 8, 8))
+        pygame.draw.rect(s, C_ISO_LOCK_T,  (cx-2, cy-6, 4, 7))
+        pygame.draw.rect(s, C_ISO_LOCK_T,  (cx-2, cy+2, 4, 4))
         hint = self.font_small.render("[S]", True, C_LOCKED_ICON)
-        self.screen.blit(hint, (sx + ISO_HALF_W - 18, sy + ISO_HALF_H))
+        s.blit(hint, (cx - hint.get_width() // 2, sy + TILE_H - hint.get_height() - 4))
 
-    def draw_iso_tile(self, sx: int, sy: int, tile, r: int, c: int):
-        """Draw a single tile at iso top-vertex position (sx, sy)."""
-        seed  = (r * 0x6B + c * 0xA3 + 0xFF) & 0xFF
-        dv    = (seed % 20) - 10
+    def draw_tile(self, sx: int, sy: int, tile, r: int, c: int):
+        """Draw a single tile at rect top-left (sx, sy)."""
+        s    = self.screen
+        seed = (r * 0x6B + c * 0xA3 + 0xFF) & 0xFF
+        dv   = (seed % 18) - 9
 
         if tile.state == TileState.OBSTACLE:
-            top_c = tuple(max(0, min(255, v + dv // 2)) for v in C_ISO_STONE_T)
-            self._draw_iso_cube(sx, sy, top_c, C_ISO_STONE_L, C_ISO_STONE_R)
-            # Stone cracks
-            s = self.screen;  cx2 = sx;  cy2 = sy + ISO_HALF_H
+            base = tuple(max(0, min(255, v + dv // 2)) for v in C_ISO_STONE_T)
+            pygame.draw.rect(s, base, (sx, sy, TILE_W, TILE_H))
+            # Slightly darker top edge (far side)
+            pygame.draw.rect(s, C_ISO_STONE_L, (sx, sy, TILE_W, 2))
+            # Depth strip at bottom
+            pygame.draw.rect(s, C_ISO_STONE_R, (sx, sy + TILE_H - TILE_DEPTH, TILE_W, TILE_DEPTH))
+            pygame.draw.rect(s, C_ISO_STONE_R, (sx, sy, TILE_W, TILE_H), 1)
+            # Cracks
             h2 = r * 23 + c * 41 + 7
             for i in range(3):
-                ox2 = ((h2 * (i+1) * 17) % (ISO_HALF_W)) - ISO_HALF_W // 2
-                oy2 = ((h2 * (i+1) * 11) % (ISO_HALF_H)) - ISO_HALF_H // 2
-                pygame.draw.line(s, C_ISO_STONE_R, (cx2+ox2, cy2+oy2),
-                                 (cx2+ox2+5, cy2+oy2+3), 1)
+                ox2 = ((h2*(i+1)*17) % (TILE_W - 10)) + 5
+                oy2 = ((h2*(i+1)*11) % (TILE_H - 10)) + 5
+                pygame.draw.line(s, C_ISO_STONE_R, (sx+ox2, sy+oy2), (sx+ox2+6, sy+oy2+4), 1)
         else:
-            base = C_ISO_SOIL_T
             if tile.state == TileState.PLANTED:
-                base = (max(0, C_ISO_SOIL_T[0]-14), max(0, C_ISO_SOIL_T[1]-8),
-                        min(255, C_ISO_SOIL_T[2]+6))
-            top_c = tuple(max(0, min(255, v + dv // 2)) for v in base)
-            self._draw_iso_cube(sx, sy, top_c, C_ISO_SOIL_L, C_ISO_SOIL_R)
-            # Texture dots on top face
-            cx2 = sx;  cy2 = sy + ISO_HALF_H
-            for ddx, ddy, col in self._get_iso_dots(r, c):
-                pygame.draw.rect(self.screen, col, (cx2+ddx, cy2+ddy, 2, 1))
+                base = (max(0, C_ISO_SOIL_T[0]-12), max(0, C_ISO_SOIL_T[1]-6),
+                        min(255, C_ISO_SOIL_T[2]+5))
+            else:
+                base = C_ISO_SOIL_T
+            fc = tuple(max(0, min(255, v + dv // 2)) for v in base)
+            # Main surface
+            pygame.draw.rect(s, fc, (sx, sy, TILE_W, TILE_H))
+            # Far-edge shadow (top, 2px)
+            pygame.draw.rect(s, C_ISO_SOIL_L, (sx, sy, TILE_W, 2))
+            # Tilt depth strip (bottom)
+            pygame.draw.rect(s, C_ISO_SOIL_R, (sx, sy + TILE_H - TILE_DEPTH, TILE_W, TILE_DEPTH))
+            # Tile border
+            pygame.draw.rect(s, C_TILE_BDR, (sx, sy, TILE_W, TILE_H), 1)
+            # Soil texture dots
+            for ddx, ddy, col in self._get_tile_dots(r, c):
+                pygame.draw.rect(s, col, (sx + ddx, sy + ddy, 2, 1))
+            # Crop content
             if tile.state == TileState.PLANTED:
-                self._draw_iso_sprout(sx, sy, tile)
-                self._draw_iso_pips(sx, sy, tile)
+                self._draw_sprout(sx, sy, tile)
+                self._draw_pips(sx, sy, tile)
             elif tile.state == TileState.READY:
-                self._draw_iso_crop(sx, sy, tile)
+                self._draw_crop(sx, sy, tile)
 
-    # ── isometric robot ───────────────────────────────────────────────────────
+    # ── top-down robot ────────────────────────────────────────────────────────
 
     def draw_robot(self, robot: Robot, anim_type: str, t_raw: float):
-        s = self.screen
-        bob = int(-math.sin(t_raw * math.pi) * 4) if anim_type == 'move' else 0
+        s  = self.screen
+        # Slight vertical bob while moving
+        bob = int(-math.sin(t_raw * math.pi) * 3) if anim_type == 'move' else 0
         cx  = int(robot.px)
-        cy  = int(robot.py) + bob   # tile-face centre is the "feet" anchor
+        cy  = int(robot.py) + bob
 
-        # 1. Ground shadow
-        pygame.draw.ellipse(s, C_ISO_SHADOW, (cx - 15, cy - 5, 30, 11))
+        # Shadow (offset slightly south = toward camera)
+        pygame.draw.ellipse(s, C_ISO_SHADOW, (cx - 14, cy + 4, 28, 9))
 
-        # 2. Legs (short, under the body)
-        leg_y = cy - 4
-        pygame.draw.rect(s, C_OV_DARK, (cx - 7, leg_y - 8, 5, 9))
-        pygame.draw.rect(s, C_OV_DARK, (cx + 2,  leg_y - 8, 5, 9))
-        pygame.draw.rect(s, C_BOT_DARK, (cx - 5,  leg_y + 1, 4, 3))  # boot
-        pygame.draw.rect(s, C_BOT_DARK, (cx + 3,  leg_y + 1, 4, 3))
+        # Body oval (denim overalls, slightly squashed for top-down tilt)
+        pygame.draw.ellipse(s, C_OV_DARK, (cx - 9,  cy - 6,  18, 14))
+        pygame.draw.ellipse(s, C_OV_MAIN, (cx - 8,  cy - 7,  16, 12))
+        # Bib highlight
+        pygame.draw.ellipse(s, (102, 140, 195), (cx - 4, cy - 6, 8, 6))
 
-        # 3. Overall body (trapezoidal iso feel)
-        body_y = leg_y - 8
-        body_h = 18
-        pygame.draw.polygon(s, C_OV_DARK, [
-            (cx - 8,  body_y + body_h),
-            (cx + 8,  body_y + body_h),
-            (cx + 10, body_y),
-            (cx - 10, body_y)])
-        pygame.draw.polygon(s, C_OV_MAIN, [
-            (cx - 10, body_y + body_h),
-            (cx + 10, body_y + body_h),
-            (cx + 10, body_y),
-            (cx - 10, body_y)])
-        # Overalls bib
-        pygame.draw.rect(s, C_OV_MAIN, (cx - 5, body_y + 2, 10, 10))
-        # Straps
-        pygame.draw.line(s, (102, 140, 195), (cx - 4, body_y + 2), (cx - 6, body_y + body_h - 2), 2)
-        pygame.draw.line(s, (102, 140, 195), (cx + 4, body_y + 2), (cx + 6, body_y + body_h - 2), 2)
-        # Side shading
-        pygame.draw.polygon(s, C_OV_DARK, [
-            (cx + 7,  body_y + body_h),
-            (cx + 10, body_y + body_h),
-            (cx + 10, body_y),
-            (cx + 7,  body_y)])
+        # Straw hat brim (large circle — dominant in top-down view)
+        pygame.draw.ellipse(s, (148, 114, 40), (cx - 16, cy - 22, 32, 20))  # brim shadow
+        pygame.draw.ellipse(s, C_HAT_BRIM,     (cx - 15, cy - 24, 30, 20))  # brim
+        # Hat dome (inner circle, slightly offset for tilt)
+        pygame.draw.ellipse(s, C_HAT_DOME,     (cx - 9,  cy - 26, 18, 14))
+        pygame.draw.ellipse(s, (220, 188, 96), (cx - 5,  cy - 25,  8,  7))  # dome highlight
+        # Hat band
+        pygame.draw.ellipse(s, C_HAT_BAND, (cx - 10, cy - 17, 20, 6))
 
-        # 4. Head
-        head_y = body_y - 13
-        pygame.draw.rect(s, C_BOT_FACE, (cx - 7, head_y, 14, 13))
-        pygame.draw.rect(s, C_BOT_DARK, (cx + 4, head_y + 1, 3, 12))   # right shading
+        # Face direction indicator: small coloured dot on the edge of the hat
+        ar  = math.radians(robot.visual_angle)
+        fr  = 11.0
+        fdx = math.cos(ar) * fr
+        fdy = math.sin(ar) * fr * 0.6   # squash y slightly for tilt perspective
+        fx  = int(cx + fdx)
+        fy  = int(cy - 20 + fdy)        # anchored to hat centre height
+        pygame.draw.circle(s, C_BOT_FACE, (fx, fy), 4)
+        pygame.draw.circle(s, C_BOT_EYE,  (fx, fy), 2)
 
-        # 5. Face panel + eyes from visual_angle (smooth rotation)
-        ar   = math.radians(robot.visual_angle)
-        fr   = 6.0
-        fcx  = cx + math.cos(ar) * fr
-        fcy  = (head_y + 6) + math.sin(ar) * 2.5
-        abss = abs(math.sin(ar));  absc = abs(math.cos(ar))
-        fw   = round(8 * absc + 12 * abss)
-        fh   = round(12 * absc + 8  * abss)
-        pygame.draw.rect(s, C_BOT_FACE, (int(fcx - fw/2), int(fcy - fh/2), fw, fh))
-        px2 = -math.sin(ar);  py2 = math.cos(ar)
-        e1  = (int(fcx - px2 * 2.5 - 1), int(fcy - py2 * 2.5 - 1))
-        e2  = (int(fcx + px2 * 2.5 - 1), int(fcy + py2 * 2.5 - 1))
-        pygame.draw.rect(s, C_BOT_EYE, (*e1, 3, 3))
-        pygame.draw.rect(s, C_BOT_EYE, (*e2, 3, 3))
-
-        # 6. Straw hat
-        hat_by = head_y - 2
-        pygame.draw.ellipse(s, (156, 120, 44), (cx - 14, hat_by - 2, 28, 10))  # brim shadow
-        pygame.draw.ellipse(s, C_HAT_BRIM,     (cx - 14, hat_by - 4, 28, 10))  # brim
-        pygame.draw.ellipse(s, C_HAT_DOME,     (cx - 8,  hat_by - 16, 16, 16)) # dome
-        pygame.draw.ellipse(s, (156, 120, 44), (cx - 5,  hat_by - 2,  10,  6)) # brim indent
-        pygame.draw.rect(s,    C_HAT_BAND,     (cx - 7,  hat_by - 8,  14,  3)) # band
-
-    # ── isometric environment ─────────────────────────────────────────────────
+    # ── top-down environment ──────────────────────────────────────────────────
 
     def _draw_left_bg(self, grid: Grid, tod: float = 0.25):
         s = self.screen
-        # Sky gradient — regenerated whenever tod shifts enough
+        # Background gradient (serves as ambient light colour, tied to time of day)
         sky_top, sky_bot = _sky_colors(tod)
         if abs(tod - self._sky_tod) > 0.004:
             self._sky_tod = tod
             for _y in range(WIN_H):
-                _t = min(1.0, _y / (WIN_H * 0.62))
+                _t = min(1.0, _y / (WIN_H * 0.72))
                 _c = _lerp_c(sky_top, sky_bot, _t)
                 self._sky_surf.fill(_c, (0, _y, PANEL_W, 1))
         s.blit(self._sky_surf, (0, 0))
 
-        # Soft ground fill below the grid
-        vrec = grid.visual_rect()
-        ground_y = vrec.bottom - 10
-        pygame.draw.rect(s, C_GRASS, (0, ground_y, PANEL_W, WIN_H - ground_y))
-        pygame.draw.rect(s, C_GRASS_DK, (0, ground_y, PANEL_W, 4))
+        # Grass ground — fills area below (and around) the tile grid
+        vrec     = grid.visual_rect()
+        ground_y = vrec.bottom - 4
+        pygame.draw.rect(s, C_GRASS,    (0, ground_y, PANEL_W, WIN_H - ground_y))
+        pygame.draw.rect(s, C_GRASS_DK, (0, ground_y, PANEL_W, 3))
         for i in range(0, PANEL_W, 12):
             pygame.draw.rect(s, C_GRASS_LT, (i,     ground_y - 3, 4, 5))
-            pygame.draw.rect(s, C_GRASS,    (i + 6, ground_y - 5, 3, 5))
+            pygame.draw.rect(s, C_GRASS,    (i + 6, ground_y - 5, 3, 4))
 
-        # Platform base: draw front face below the bottom-row tiles
-        vr0, vr1, vc0, vc1 = grid._vis_extent()
-        plat_points = []
-        for c in range(vc0, vc1 + 1):
-            sx, sy = grid.tile_px(vr1, c)
-            if not plat_points:
-                plat_points.append((sx - ISO_HALF_W, sy + ISO_HALF_H))
-            plat_points.append((sx, sy + ISO_HALF_H * 2))
-        for sx_r, sy_r in reversed(plat_points):
-            plat_points.append((sx_r, sy_r + BLOCK_H + 6))
-        if len(plat_points) >= 3:
-            pygame.draw.polygon(s, C_ISO_PLAT_F, plat_points)
-            pygame.draw.polygon(s, C_TILE_BDR,   plat_points, 1)
-
-        # Right edge platform side face (right column tiles)
-        r_pts = []
-        for r in range(vr0, vr1 + 1):
-            sx, sy = grid.tile_px(r, vc1)
-            if not r_pts:
-                r_pts.append((sx, sy + ISO_HALF_H * 2))
-            r_pts.append((sx + ISO_HALF_W, sy + ISO_HALF_H))
-        for sx2, sy2 in reversed(r_pts):
-            r_pts.append((sx2, sy2 + BLOCK_H + 6))
-        if len(r_pts) >= 3:
-            pygame.draw.polygon(s, C_ISO_SOIL_R, r_pts)
-            pygame.draw.polygon(s, C_TILE_BDR,   r_pts, 1)
+        # Subtle drop-shadow under the whole grid block
+        shadow_rect = pygame.Rect(vrec.x + 5, vrec.y + 5, vrec.w, vrec.h)
+        shadow_surf = pygame.Surface((shadow_rect.w, shadow_rect.h), pygame.SRCALPHA)
+        shadow_surf.fill((0, 0, 0, 40))
+        s.blit(shadow_surf, (shadow_rect.x, shadow_rect.y))
 
     def _draw_time_indicator(self, s, tod: float, day: int):
         """Small arc + sun/moon dial showing current time of day."""
@@ -1322,19 +1235,19 @@ class Renderer:
         # ── left panel ───────────────────────────────────────────────────────
         self._draw_left_bg(state.grid, state.time_of_day)
 
-        # Painter's algorithm: sorted by (r+c) ascending, r ascending within depth
+        # Painter's algorithm: back rows first (r ascending), then c ascending
         grid = state.grid
         _locked = set(grid.locked_positions())
         _all    = {(r, c): ('locked', None) for r, c in _locked}
         for (r, c), tile in grid.tiles.items():
             _all[(r, c)] = ('tile', tile)
-        for (r, c) in sorted(_all, key=lambda rc: (rc[0]+rc[1], rc[0])):
+        for (r, c) in sorted(_all, key=lambda rc: (rc[0], rc[1])):
             sx, sy = grid.tile_px(r, c)
             kind, tile = _all[(r, c)]
             if kind == 'locked':
-                self._draw_iso_locked(sx, sy)
+                self._draw_locked(sx, sy)
             else:
-                self.draw_iso_tile(sx, sy, tile, r, c)
+                self.draw_tile(sx, sy, tile, r, c)
 
         # Robot drawn last (flat grid — always on top of tiles)
         _t_raw = min(1.0, state.anim_elapsed / state.anim_duration) if (state.animating and state.anim_duration > 0) else 0.0
