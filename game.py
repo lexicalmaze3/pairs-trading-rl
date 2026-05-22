@@ -22,6 +22,7 @@ TURN_DURATION  = 0.20   # s for turn arc
 BUMP_DURATION  = 0.22   # s for invalid-move bump
 PAUSE_DURATION = 0.15   # s for plant / harvest / wait
 BUMP_DIST      = 18     # px offset during bump
+DAY_DURATION   = 60.0   # real seconds per full day/night cycle
 
 CURSOR_BLINK_MS = 530
 
@@ -211,6 +212,39 @@ def _iso_right_pts(sx: int, sy: int) -> list:
             (sx + ISO_HALF_W, sy + ISO_HALF_H + BLOCK_H),
             (sx, sy + ISO_HALF_H * 2 + BLOCK_H)]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Day / night colour helpers
+# ─────────────────────────────────────────────────────────────────────────────
+# Keyframes: (time_of_day, sky_top_rgb, sky_bot_rgb)
+# 0.0=dawn  0.25=midday  0.5=dusk  0.75=midnight
+_SKY_KEYS = [
+    (0.00, (200, 115,  75), (245, 170, 105)),   # dawn  — pink / soft orange
+    (0.25, (132, 185, 218), (208, 210, 190)),   # midday — pale blue / warm cream
+    (0.50, (148,  68,  52), (105,  58, 118)),   # dusk  — deep orange / purple
+    (0.75, ( 10,  14,  44), (  5,   8,  28)),   # midnight — deep navy
+    (1.00, (200, 115,  75), (245, 170, 105)),   # wraps back to dawn
+]
+
+def _lerp_c(ca, cb, t):
+    return (int(ca[0] + (cb[0]-ca[0])*t),
+            int(ca[1] + (cb[1]-ca[1])*t),
+            int(ca[2] + (cb[2]-ca[2])*t))
+
+def _sky_colors(tod: float):
+    """Return (top_rgb, bot_rgb) for the given time-of-day."""
+    for i in range(len(_SKY_KEYS) - 1):
+        t0, a0, b0 = _SKY_KEYS[i]
+        t1, a1, b1 = _SKY_KEYS[i + 1]
+        if t0 <= tod <= t1:
+            f = (tod - t0) / (t1 - t0)
+            return _lerp_c(a0, a1, f), _lerp_c(b0, b1, f)
+    return _SKY_KEYS[0][1], _SKY_KEYS[0][2]
+
+def _night_alpha(tod: float) -> int:
+    """Overlay opacity: 0 at midday (0.25), 160 at midnight (0.75), smooth cosine."""
+    phase = (tod - 0.75) * 2 * math.pi   # 0 at midnight, ±π at midday
+    return max(0, int((math.cos(phase) + 1) / 2 * 160))
+
 @dataclass
 class Tile:
     state:     TileState = TileState.EMPTY
@@ -321,9 +355,9 @@ class Grid:
                 if not self.in_bounds(r, c):
                     yield r, c
 
-    def tick(self):
+    def tick(self, is_day: bool = True):
         for tile in self.tiles.values():
-            if tile.state == TileState.PLANTED:
+            if tile.state == TileState.PLANTED and is_day:
                 tile.growth_turns -= 1
                 if tile.growth_turns <= 0:
                     tile.state = TileState.READY
@@ -395,6 +429,10 @@ class GameState:
         self.unlocked_cmds: set = set()   # 'repeat', 'if_crop_ready', 'face'
         self.shop_open = False
         self.shop_tab  = 0                # 0=Grid 1=Crops 2=Commands
+        # Day / night
+        self.time_of_day  = 0.0   # 0=dawn 0.25=midday 0.5=dusk 0.75=midnight
+        self.total_time   = 0.0   # real seconds elapsed
+        self.day_number   = 1
 
     def log(self, msg, color=C_CON_WHT):
         self.console_msgs.append((msg, color))
@@ -434,6 +472,7 @@ class GameState:
         grid  = self.grid
         r, c  = robot.row, robot.col
         dr, dc = robot.direction.value
+        is_day = self.time_of_day < 0.5
 
         if verb == 'move':
             nr, nc = r + dr, c + dc
@@ -447,19 +486,19 @@ class GameState:
                 robot.row, robot.col = nr, nc
                 robot.set_target(nr, nc, grid)
                 self._start_move()
-            grid.tick()
+            grid.tick(is_day)
 
         elif verb == 'turn_left':
             idx = DIR_ORDER.index(robot.direction)
             new_dir = DIR_ORDER[(idx - 1) % 4]
             robot.direction = new_dir
-            grid.tick();  self._start_turn(new_dir)
+            grid.tick(is_day);  self._start_turn(new_dir)
 
         elif verb == 'turn_right':
             idx = DIR_ORDER.index(robot.direction)
             new_dir = DIR_ORDER[(idx + 1) % 4]
             robot.direction = new_dir
-            grid.tick();  self._start_turn(new_dir)
+            grid.tick(is_day);  self._start_turn(new_dir)
 
         elif verb == 'plant':
             crop_name = action[1] if len(action) > 1 else 'carrot'
@@ -474,7 +513,7 @@ class GameState:
                     f"Grows in {crop_info.turns} turns.", C_CON_YLW)
             else:
                 self.log(f"plant(): tile ({r},{c}) is not empty soil.", C_CON_RED)
-            grid.tick();  self._start_pause()
+            grid.tick(is_day);  self._start_pause()
 
         elif verb == 'harvest':
             tile = grid.get(r, c)
@@ -488,10 +527,10 @@ class GameState:
                     f"+{crop_info.points} pts  (total: {self.points})", C_CON_GRN)
             else:
                 self.log(f"harvest(): tile ({r},{c}) not ready to harvest.", C_CON_RED)
-            grid.tick();  self._start_pause()
+            grid.tick(is_day);  self._start_pause()
 
         elif verb == 'wait':
-            grid.tick();  self._start_pause()
+            grid.tick(is_day);  self._start_pause()
 
         elif verb == 'face':
             dir_map = {
@@ -501,10 +540,10 @@ class GameState:
             d = dir_map.get(str(action[1]).lower())
             if d:
                 robot.direction = d
-                grid.tick();  self._start_turn(d)
+                grid.tick(is_day);  self._start_turn(d)
             else:
                 self.log(f"face(): unknown direction '{action[1]}'", C_CON_RED)
-                grid.tick();  self._start_pause()
+                grid.tick(is_day);  self._start_pause()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sandbox executor
@@ -732,14 +771,10 @@ class Renderer:
         self._overlay.fill((0, 0, 0, 165))
         self.shop_tab_rects: list = []
         self.shop_buy_rects: list = []
-        # Pre-render sky gradient (pale azure → warm cream horizon)
+        # Sky surface regenerated lazily as time-of-day changes
         self._sky_surf = pygame.Surface((PANEL_W, WIN_H))
-        for _y in range(WIN_H):
-            _t = min(1.0, _y / (WIN_H * 0.62))
-            _c = (int(C_SKY_TOP[0] + (C_SKY_BOT[0]-C_SKY_TOP[0])*_t),
-                  int(C_SKY_TOP[1] + (C_SKY_BOT[1]-C_SKY_TOP[1])*_t),
-                  int(C_SKY_TOP[2] + (C_SKY_BOT[2]-C_SKY_TOP[2])*_t))
-            self._sky_surf.fill(_c, (0, _y, PANEL_W, 1))
+        self._sky_tod  = -1.0   # force redraw on first frame
+        self._night_ov = pygame.Surface((PANEL_W, WIN_H), pygame.SRCALPHA)
 
     # ── iso tile rendering ────────────────────────────────────────────────────
 
@@ -979,9 +1014,16 @@ class Renderer:
 
     # ── isometric environment ─────────────────────────────────────────────────
 
-    def _draw_left_bg(self, grid: Grid):
+    def _draw_left_bg(self, grid: Grid, tod: float = 0.25):
         s = self.screen
-        # Sky gradient
+        # Sky gradient — regenerated whenever tod shifts enough
+        sky_top, sky_bot = _sky_colors(tod)
+        if abs(tod - self._sky_tod) > 0.004:
+            self._sky_tod = tod
+            for _y in range(WIN_H):
+                _t = min(1.0, _y / (WIN_H * 0.62))
+                _c = _lerp_c(sky_top, sky_bot, _t)
+                self._sky_surf.fill(_c, (0, _y, PANEL_W, 1))
         s.blit(self._sky_surf, (0, 0))
 
         # Soft ground fill below the grid
@@ -1019,6 +1061,46 @@ class Renderer:
         if len(r_pts) >= 3:
             pygame.draw.polygon(s, C_ISO_SOIL_R, r_pts)
             pygame.draw.polygon(s, C_TILE_BDR,   r_pts, 1)
+
+    def _draw_time_indicator(self, s, tod: float, day: int):
+        """Small arc + sun/moon dial showing current time of day."""
+        cx, cy = PANEL_W - 80, 60
+        arc_r  = 26
+
+        # Horizon line
+        h_col = (85, 68, 45) if tod < 0.5 else (55, 58, 88)
+        pygame.draw.line(s, h_col, (cx - arc_r - 4, cy), (cx + arc_r + 4, cy), 1)
+
+        # Semi-circle arc (upper half)
+        arc_col = (130, 110, 75) if tod < 0.5 else (65, 72, 115)
+        arc_rect = pygame.Rect(cx - arc_r, cy - arc_r, arc_r * 2, arc_r * 2)
+        pygame.draw.arc(s, arc_col, arc_rect, 0, math.pi, 1)
+
+        if tod < 0.5:
+            # Sun: left at dawn (0.0) → top at midday (0.25) → right at dusk (0.5)
+            sun_ang = math.pi * (1.0 - tod / 0.5)
+            sx = int(cx + arc_r * math.cos(sun_ang))
+            sy = int(cy - arc_r * math.sin(sun_ang))
+            pygame.draw.circle(s, (255, 210,  70), (sx, sy), 9)
+            pygame.draw.circle(s, (255, 238, 140), (sx, sy), 6)
+            pygame.draw.circle(s, (255, 252, 210), (sx, sy), 3)
+        else:
+            # Moon: left at dusk (0.5) → top at midnight (0.75) → right at dawn (1.0)
+            moon_frac = (tod - 0.5) / 0.5
+            moon_ang  = math.pi * (1.0 - moon_frac)
+            mx = int(cx + arc_r * math.cos(moon_ang))
+            my = int(cy - arc_r * math.sin(moon_ang))
+            pygame.draw.circle(s, (190, 200, 225), (mx, my), 7)
+            pygame.draw.circle(s, (215, 222, 240), (mx, my), 5)
+            # Crescent cutout using approximate sky colour at that y position
+            sky_top, sky_bot = _sky_colors(tod)
+            sky_t = min(1.0, my / (WIN_H * 0.62))
+            sky_here = _lerp_c(sky_top, sky_bot, sky_t)
+            pygame.draw.circle(s, sky_here, (mx + 4, my - 2), 5)
+
+        # Day counter below arc
+        day_lbl = self.font_small.render(f"Day {day}", True, C_WARM_GRY)
+        s.blit(day_lbl, (cx - day_lbl.get_width() // 2, cy + arc_r + 4))
 
     def _draw_wood_panel(self):
         s = self.screen
@@ -1238,7 +1320,7 @@ class Renderer:
         s = self.screen
 
         # ── left panel ───────────────────────────────────────────────────────
-        self._draw_left_bg(state.grid)
+        self._draw_left_bg(state.grid, state.time_of_day)
 
         # Painter's algorithm: sorted by (r+c) ascending, r ascending within depth
         grid = state.grid
@@ -1257,6 +1339,15 @@ class Renderer:
         # Robot drawn last (flat grid — always on top of tiles)
         _t_raw = min(1.0, state.anim_elapsed / state.anim_duration) if (state.animating and state.anim_duration > 0) else 0.0
         self.draw_robot(state.robot, state.anim_type if state.animating else 'none', _t_raw)
+
+        # Night overlay (after tiles + robot, before UI labels)
+        _nalpha = _night_alpha(state.time_of_day)
+        if _nalpha > 0:
+            self._night_ov.fill((30, 20, 60, _nalpha))
+            s.blit(self._night_ov, (0, 0))
+
+        # Time-of-day indicator (sun/moon arc + day counter)
+        self._draw_time_indicator(s, state.time_of_day, state.day_number)
 
         # Title + points
         s.blit(self.font_big.render("Farm Bot", True, C_GOLD), (20, 14))
@@ -1476,6 +1567,13 @@ def main():
     while game_running:
         dt        = clock.tick(60) / 1000.0
         mouse_pos = pygame.mouse.get_pos()
+
+        # ── day / night progression ──────────────────────────────────────────
+        _prev_days = int(state.total_time / DAY_DURATION)
+        state.total_time += dt
+        if int(state.total_time / DAY_DURATION) > _prev_days:
+            state.day_number += 1
+        state.time_of_day = (state.total_time % DAY_DURATION) / DAY_DURATION
         btn_hover = btn_rect.collidepoint(mouse_pos) and not state.running and not state.shop_open
 
         # ── events ──────────────────────────────────────────────────────────
