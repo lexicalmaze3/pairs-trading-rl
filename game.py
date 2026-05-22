@@ -22,7 +22,7 @@ TURN_DURATION  = 0.20   # s for turn arc
 BUMP_DURATION  = 0.22   # s for invalid-move bump
 PAUSE_DURATION = 0.15   # s for plant / harvest / wait
 BUMP_DIST      = 18     # px offset during bump
-DAY_DURATION   = 60.0   # real seconds per full day/night cycle
+DAY_DURATION   = 180.0  # real seconds per full day/night cycle
 
 CURSOR_BLINK_MS = 530
 
@@ -482,7 +482,7 @@ class GameState:
                 tile.crop_type    = crop_name
                 self.log(
                     f"Planted {crop_info.name} at ({r},{c}). "
-                    f"Grows in {crop_info.turns} turns.", C_CON_YLW)
+                    f"Grows in {crop_info.turns} turns.", C_CON_WHT)
             else:
                 self.log(f"plant(): tile ({r},{c}) is not empty soil.", C_CON_RED)
             grid.tick(is_day);  self._start_pause()
@@ -1435,9 +1435,6 @@ def main():
     editor  = EditorComponent(editor_rect, renderer.font_mono)
     console = ConsoleComponent(console_rect, renderer.font_mono)
 
-    state.log("Welcome! Write commands and press Run.  Press S to open the shop.", C_CON_GRY)
-    state.log("Commands: move()  turn_left()  turn_right()  plant()  harvest()  wait()", C_CON_GRY)
-    state.log('Set crop type with: crop = "wheat" / "carrot" / "pumpkin"', C_CON_GRY)
 
     game_running = True
     while game_running:
