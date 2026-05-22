@@ -673,24 +673,20 @@ class EditorComponent:
             self.scroll_offset = self.cursor_line - vis + 1
 
     def draw(self, surf: pygame.Surface):
-        pygame.draw.rect(surf, C_PARCHMENT, self.rect)
+        pygame.draw.rect(surf, (12, 12, 12), self.rect)
         line_h = self.font.get_linesize()
         pad = 8
         vis_lines = (self.rect.height - pad * 2) // line_h
-        for i in range(vis_lines + 1):
-            ly = self.rect.y + pad + i * line_h + line_h - 2
-            if ly < self.rect.bottom - 2:
-                pygame.draw.line(surf, C_PARCH_LINE,
-                                 (self.rect.x + 4, ly), (self.rect.right - 4, ly), 1)
-        pygame.draw.rect(surf, C_PARCH_DK, (self.rect.x, self.rect.y, 28, self.rect.height))
-        pygame.draw.line(surf, C_EDITOR_BDR,
+        # Line-number gutter
+        pygame.draw.rect(surf, (24, 24, 24), (self.rect.x, self.rect.y, 28, self.rect.height))
+        pygame.draw.line(surf, (50, 50, 50),
                          (self.rect.x + 28, self.rect.y), (self.rect.x + 28, self.rect.bottom), 1)
         for i in range(vis_lines):
             li = i + self.scroll_offset
             if li >= len(self.lines): break
-            surf.blit(self.font.render(str(li + 1), True, C_WARM_GRY),
+            surf.blit(self.font.render(str(li + 1), True, (80, 80, 80)),
                       (self.rect.x + 4, self.rect.y + pad + i * line_h))
-            surf.blit(self.font.render(self.lines[li], True, C_INK),
+            surf.blit(self.font.render(self.lines[li], True, (220, 220, 220)),
                       (self.rect.x + 34, self.rect.y + pad + i * line_h))
         show_cursor = (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0
         if self.focused and show_cursor:
@@ -699,8 +695,8 @@ class EditorComponent:
                 partial = self.lines[self.cursor_line][:self.cursor_col]
                 cx = self.rect.x + 34 + self.font.size(partial)[0]
                 cy = self.rect.y + pad + vis_li * line_h
-                pygame.draw.line(surf, C_CURSOR_AMB, (cx, cy), (cx, cy + line_h - 2), 2)
-        pygame.draw.rect(surf, C_EDITOR_BDR, self.rect, 2)
+                pygame.draw.line(surf, (200, 200, 200), (cx, cy), (cx, cy + line_h - 2), 2)
+        pygame.draw.rect(surf, (50, 50, 50), self.rect, 1)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Console Component  (unchanged)
