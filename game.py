@@ -1186,27 +1186,49 @@ class Renderer:
     def _draw_shop_cmds_tab(self, s, cy, ch, state: GameState, mouse_pos):
         x0 = SHOP_X + 8
         CMDS = [
-            ('repeat',       'repeat(n, [cmd, …])',
-             'Repeat a list of commands n times.    e.g.  repeat(3, [move, harvest])'),
-            ('if_crop_ready','if_crop_ready()',
-             'Returns True if current tile has a ready-to-harvest crop.'),
-            ('face',         'face(direction)',
-             'Instantly face a direction.    e.g.  face("north") / face("east")'),
+            ('repeat',        'repeat(n, [cmd, …])',
+             'Repeats a list of commands n times.',
+             'repeat(3, [move, harvest])'),
+            ('if_crop_ready', 'if_crop_ready()',
+             'Returns True if the current tile has a crop ready to harvest.',
+             'if if_crop_ready(): harvest()'),
+            ('face',          'face(direction)',
+             'Instantly faces the robot in a cardinal direction.',
+             'face("north")'),
         ]
-        for i, (key, sig, desc) in enumerate(CMDS):
-            owned = key in state.unlocked_cmds
-            row = pygame.Rect(x0, cy + 6 + i * 80, SHOP_W - 16, 72)
-            pygame.draw.rect(s, C_SHOP_ROW_A if i % 2 == 0 else C_SHOP_ROW_B,
-                             row, border_radius=4)
+        row_h   = 96
+        row_gap = 6
+        for i, (key, sig, desc, example) in enumerate(CMDS):
+            owned   = key in state.unlocked_cmds
+            row     = pygame.Rect(x0, cy + 4 + i * (row_h + row_gap), SHOP_W - 16, row_h)
+            bg_col  = C_SHOP_ROW_A if i % 2 == 0 else C_SHOP_ROW_B
+            pygame.draw.rect(s, bg_col,   row, border_radius=4)
             pygame.draw.rect(s, C_WOOD_LT, row, 1, border_radius=4)
-            txt_col = C_WARM_WHT if owned else C_SHOP_LOCK_TXT
-            nm = self.font_ui.render(sig, True, txt_col)
-            s.blit(nm, (row.x + 12, row.y + 8))
-            ds = self.font_small.render(desc, True, C_WARM_GRY if owned else (80, 65, 50))
-            s.blit(ds, (row.x + 12, row.y + 32))
-            cost_s = self.font_label.render("10 pts", True, C_GOLD if not owned else C_WARM_GRY)
-            s.blit(cost_s, (row.x + 12, row.y + 52))
-            self._shop_buy_btn(s, row.right - 80, row.y + 18, 68, 34,
+
+            txt_col  = C_WARM_WHT if owned else C_SHOP_LOCK_TXT
+            desc_col = C_WARM_GRY if owned else (80, 65, 50)
+
+            # Signature
+            s.blit(self.font_ui.render(sig, True, txt_col),
+                   (row.x + 12, row.y + 8))
+
+            # One-line description
+            s.blit(self.font_label.render(desc, True, desc_col),
+                   (row.x + 12, row.y + 30))
+
+            # Example box (dark warm rect + monospace yellow text)
+            ex_surf = self.font_mono.render(example, True, C_CON_YLW)
+            ex_rect = pygame.Rect(row.x + 12, row.y + 50,
+                                  ex_surf.get_width() + 10, ex_surf.get_height() + 4)
+            pygame.draw.rect(s, (28, 18, 8),   ex_rect, border_radius=3)
+            pygame.draw.rect(s, C_DIVIDER,      ex_rect, 1, border_radius=3)
+            s.blit(ex_surf, (ex_rect.x + 5, ex_rect.y + 2))
+
+            # Cost + buy button
+            cost_col = C_GOLD if not owned else C_WARM_GRY
+            s.blit(self.font_label.render("10 pts", True, cost_col),
+                   (row.x + 12, row.y + row_h - 18))
+            self._shop_buy_btn(s, row.right - 80, row.y + (row_h - 34) // 2, 68, 34,
                                key, state.points >= 10, owned, mouse_pos)
 
     # ── main draw call ────────────────────────────────────────────────────────
