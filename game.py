@@ -1004,6 +1004,18 @@ class EditorComponent:
         self.cursor_line = max(0, min(self.cursor_line, len(self.lines) - 1))
         self.cursor_col  = max(0, min(self.cursor_col, len(self.lines[self.cursor_line])))
 
+    def _paste_text(self, text: str):
+        for ch in text.replace('\r\n', '\n').replace('\r', '\n'):
+            if ch == '\n':
+                line = self.lines[self.cursor_line]
+                self.lines[self.cursor_line] = line[:self.cursor_col]
+                self.lines.insert(self.cursor_line + 1, line[self.cursor_col:])
+                self.cursor_line += 1; self.cursor_col = 0
+            elif ch.isprintable():
+                line = self.lines[self.cursor_line]
+                self.lines[self.cursor_line] = line[:self.cursor_col] + ch + line[self.cursor_col:]
+                self.cursor_col += 1
+
     def handle_event(self, event):
         if event.type != pygame.KEYDOWN: return
         key  = event.key
@@ -1013,6 +1025,33 @@ class EditorComponent:
             self.cursor_col = 0; return
         if ctrl and key == pygame.K_e:
             self.cursor_col = len(self.lines[self.cursor_line]); return
+
+        if ctrl and key == pygame.K_c:
+            try:
+                pygame.scrap.put(pygame.SCRAP_TEXT, self.text.encode())
+            except Exception:
+                pass
+            return
+
+        if ctrl and key == pygame.K_x:
+            try:
+                pygame.scrap.put(pygame.SCRAP_TEXT, self.text.encode())
+            except Exception:
+                pass
+            self.lines = [""]
+            self.cursor_line = 0; self.cursor_col = 0; self.scroll_offset = 0
+            return
+
+        if ctrl and key == pygame.K_v:
+            try:
+                data = pygame.scrap.get(pygame.SCRAP_TEXT)
+                if data:
+                    text = data.decode('utf-8', errors='replace').rstrip('\x00')
+                    self._paste_text(text)
+            except Exception:
+                pass
+            self._clamp_cursor()
+            return
 
         if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
             line = self.lines[self.cursor_line]
@@ -2233,6 +2272,10 @@ def main():
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     pygame.display.set_caption("Farm Bot")
+    try:
+        pygame.scrap.init()
+    except Exception:
+        pass
     clock = pygame.time.Clock()
 
     state     = GameState()
