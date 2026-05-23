@@ -1,4 +1,5 @@
 import ast
+import random
 import sys
 import math
 from collections import deque
@@ -231,6 +232,19 @@ class Tile:
     growth_turns: int    = 0
     crop_type: str       = "carrot"   # NEW
 
+@dataclass
+class Challenge:
+    key:         str
+    name:        str
+    desc:        str
+    goal:        int
+    progress:    int   = 0
+    reward_type: str   = 'cosmetic'   # 'cosmetic','command','decoration','points'
+    reward_key:  str   = ''
+    reward_name: str   = ''
+    completed:   bool  = False
+    flash_timer: float = 0.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Grid  (dict-based for dynamic expansion)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -426,6 +440,43 @@ _SHOP_CMD_TOTAL_H    = sum(
 _SHOP_CMD_MAX_SCROLL = max(0, _SHOP_CMD_TOTAL_H - _SHOP_CMD_CONTENT_H)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Challenge definitions
+# ─────────────────────────────────────────────────────────────────────────────
+CHALLENGE_POOL = [
+    dict(key='first_harvest',    name='First Harvest',      desc='Harvest any crop for the first time.',
+         goal=1,  reward_type='cosmetic',    reward_key='golden_skin',   reward_name='Golden Skin'),
+    dict(key='green_thumb',      name='Green Thumb',        desc='Have 4+ crops planted at the same time.',
+         goal=4,  reward_type='cosmetic',    reward_key='hat_orange',    reward_name='Orange Hat'),
+    dict(key='efficient_farmer', name='Efficient Farmer',   desc='Harvest 5 crops in a single run.',
+         goal=5,  reward_type='cosmetic',    reward_key='overalls_blue', reward_name='Blue Overalls'),
+    dict(key='explorer',         name='Explorer',           desc='Visit every tile in a single run.',
+         goal=9,  reward_type='decoration',  reward_key='scarecrow',     reward_name='Scarecrow'),
+    dict(key='pumpkin_rush',     name='Pumpkin Rush',       desc='Harvest 3 pumpkins in one run.',
+         goal=3,  reward_type='cosmetic',    reward_key='hat_dark',      reward_name='Dark Hat'),
+    dict(key='wheat_baron',      name='Wheat Baron',        desc='Harvest 20 wheat total.',
+         goal=20, reward_type='decoration',  reward_key='well',          reward_name='Stone Well'),
+    dict(key='night_owl',        name='Night Owl',          desc='Harvest 5 crops at night.',
+         goal=5,  reward_type='cosmetic',    reward_key='lantern',       reward_name='Lantern'),
+    dict(key='programmer',       name='Programmer',         desc='Use a for-loop in your code.',
+         goal=1,  reward_type='cosmetic',    reward_key='scarf_red',     reward_name='Red Scarf'),
+    dict(key='master_coder',     name='Master Coder',       desc='Use for, while, and def in one run.',
+         goal=3,  reward_type='points',      reward_key='',              reward_name='+50 Points'),
+    dict(key='century',          name='Century',            desc='Earn 100 total points.',
+         goal=100, reward_type='points',     reward_key='',              reward_name='+25 Points'),
+    dict(key='teleporter',       name='Teleporter',         desc='Use teleport() 5 times.',
+         goal=5,  reward_type='cosmetic',    reward_key='overalls_blue', reward_name='Blue Overalls'),
+    dict(key='scanner',          name='Scanner',            desc='Use scan() 3 times.',
+         goal=3,  reward_type='points',      reward_key='',              reward_name='+20 Points'),
+]
+
+def _make_challenge(d: dict) -> Challenge:
+    return Challenge(
+        key=d['key'], name=d['name'], desc=d['desc'], goal=d['goal'],
+        reward_type=d['reward_type'], reward_key=d['reward_key'],
+        reward_name=d['reward_name'],
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Robot
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -479,12 +530,45 @@ class GameState:
         self.tiles_purchased = 0
         self.unlocked_cmds: set = set()   # 'repeat', 'if_crop_ready', 'face'
         self.shop_open = False
-        self.shop_tab        = 0     # 0=Grid 1=Crops 2=Commands
+        self.shop_tab        = 0     # 0=Grid 1=Crops 2=Commands 3=Challenges
         self.shop_cmd_scroll = 0
+        self.shop_ch_scroll  = 0
         # Day / night
         self.time_of_day  = 0.0   # 0=dawn 0.25=midday 0.5=dusk 0.75=midnight
         self.total_time   = 0.0   # real seconds elapsed
         self.day_number   = 1
+        # Cosmetics & decorations
+        self.cosmetics:   set = set()
+        self.decorations: set = set()
+        # Challenges
+        self.active_challenges:    list = []
+        self.completed_challenge_keys: set = set()
+        # Per-run trackers (reset each Run press)
+        self.run_harvest_count  = 0
+        self.run_pumpkin_count  = 0
+        self.run_wheat_count    = 0
+        self.run_action_count   = 0
+        self.run_tiles_visited: set = set()
+        self.run_has_for   = False
+        self.run_has_while = False
+        self.run_has_def   = False
+        self.run_teleport_count = 0
+        self.run_scan_count     = 0
+        # Persistent counters
+        self.total_any_harvests    = 0
+        self.total_wheat_harvests  = 0
+        self.total_pumpkin_harvests = 0
+        self.total_night_harvests  = 0
+        self.total_points_earned   = 0
+        self.total_teleports       = 0
+        self.total_scans           = 0
+        # End-of-run completion flags (prevent double-awarding)
+        self._efficient_done   = False
+        self._explorer_done    = False
+        self._programmer_done  = False
+        self._pumpkin_rush_done = False
+        self._master_coder_done = False
+        self._init_challenges()
 
     def log(self, msg, color=C_CON_WHT):
         self.console_msgs.append((msg, color))
@@ -526,6 +610,9 @@ class GameState:
         dr, dc = robot.direction.value
         is_day = self.time_of_day < 0.5
 
+        self.run_action_count += 1
+        self.run_tiles_visited.add((r, c))
+
         if verb == 'move':
             nr, nc = r + dr, c + dc
             if not grid.in_bounds(nr, nc):
@@ -537,6 +624,7 @@ class GameState:
             else:
                 robot.row, robot.col = nr, nc
                 robot.set_target(nr, nc, grid)
+                self.run_tiles_visited.add((nr, nc))
                 self._start_move()
             grid.tick(is_day)
 
@@ -574,6 +662,17 @@ class GameState:
                 tile.state = TileState.EMPTY
                 tile.growth_turns = 0
                 self.points += crop_info.points
+                self.total_points_earned += crop_info.points
+                self.total_any_harvests  += 1
+                self.run_harvest_count   += 1
+                if tile.crop_type == 'wheat':
+                    self.total_wheat_harvests += 1
+                    self.run_wheat_count      += 1
+                if tile.crop_type == 'pumpkin':
+                    self.total_pumpkin_harvests += 1
+                    self.run_pumpkin_count      += 1
+                if not is_day:
+                    self.total_night_harvests += 1
                 self.log(
                     f"Harvested {crop_info.name} at ({r},{c})! "
                     f"+{crop_info.points} pts  (total: {self.points})", C_CON_GRN)
@@ -596,6 +695,116 @@ class GameState:
             else:
                 self.log(f"face(): unknown direction '{action[1]}'", C_CON_RED)
                 grid.tick(is_day);  self._start_pause()
+
+        elif verb == 'teleport':
+            nr, nc = int(action[1]), int(action[2])
+            if not grid.in_bounds(nr, nc):
+                self.log(f"teleport(): ({nr},{nc}) is not an unlocked tile.", C_CON_RED)
+                self._start_pause()
+            elif grid.get(nr, nc).state == TileState.OBSTACLE:
+                self.log(f"teleport(): ({nr},{nc}) is an obstacle.", C_CON_RED)
+                self._start_pause()
+            else:
+                robot.row, robot.col = nr, nc
+                robot.set_target(nr, nc, grid)
+                robot.px, robot.py = robot.target_px, robot.target_py
+                self.run_teleport_count += 1
+                self.total_teleports    += 1
+                self.log(f"Teleported to ({nr},{nc}).", C_CON_WHT)
+                self._start_pause()
+            grid.tick(is_day)
+
+        elif verb == 'scan':
+            results = []
+            for (tr, tc), tile in grid.tiles.items():
+                results.append(f"({tr},{tc}):{tile.state.name[:1]}")
+            self.log("scan(): " + "  ".join(results), C_CON_WHT)
+            self.run_scan_count += 1
+            self.total_scans    += 1
+            grid.tick(is_day);  self._start_pause()
+
+        elif verb == 'auto_harvest':
+            harvested = 0
+            for (tr, tc), tile in list(grid.tiles.items()):
+                if tile.state == TileState.READY:
+                    crop_info = CROPS.get(tile.crop_type, CROPS['carrot'])
+                    tile.state = TileState.EMPTY
+                    tile.growth_turns = 0
+                    self.points += crop_info.points
+                    self.total_points_earned += crop_info.points
+                    self.total_any_harvests  += 1
+                    if tile.crop_type == 'wheat':
+                        self.total_wheat_harvests += 1
+                        self.run_wheat_count      += 1
+                    if tile.crop_type == 'pumpkin':
+                        self.total_pumpkin_harvests += 1
+                        self.run_pumpkin_count      += 1
+                    if not is_day:
+                        self.total_night_harvests += 1
+                    harvested += 1
+                    self.run_harvest_count += 1
+            self.log(f"auto_harvest(): harvested {harvested} crop(s). Total: {self.points} pts", C_CON_GRN)
+            grid.tick(is_day);  self._start_pause()
+
+    # ── challenge methods ────────────────────────────────────────────────────
+
+    def _init_challenges(self):
+        pool = list(CHALLENGE_POOL)
+        random.shuffle(pool)
+        avail = [d for d in pool if d['key'] not in self.completed_challenge_keys]
+        self.active_challenges = [_make_challenge(d) for d in avail[:2]]
+
+    def _replace_challenge(self, idx: int):
+        pool = [d for d in CHALLENGE_POOL
+                if d['key'] not in self.completed_challenge_keys
+                and not any(c.key == d['key'] for c in self.active_challenges)]
+        if pool:
+            random.shuffle(pool)
+            self.active_challenges[idx] = _make_challenge(pool[0])
+
+    def _get_ch_progress(self, ch: Challenge) -> int:
+        k = ch.key
+        if k == 'first_harvest':   return self.total_any_harvests
+        if k == 'green_thumb':
+            return sum(1 for t in self.grid.tiles.values() if t.state == TileState.PLANTED)
+        if k == 'efficient_farmer': return self.run_harvest_count
+        if k == 'explorer':         return len(self.run_tiles_visited)
+        if k == 'pumpkin_rush':     return self.run_pumpkin_count
+        if k == 'wheat_baron':      return self.total_wheat_harvests
+        if k == 'night_owl':        return self.total_night_harvests
+        if k == 'programmer':       return 1 if self.run_has_for else 0
+        if k == 'master_coder':
+            return sum([self.run_has_for, self.run_has_while, self.run_has_def])
+        if k == 'century':          return self.total_points_earned
+        if k == 'teleporter':       return self.total_teleports
+        if k == 'scanner':          return self.total_scans
+        return 0
+
+    def _complete_challenge(self, idx: int):
+        ch = self.active_challenges[idx]
+        ch.completed   = True
+        ch.flash_timer = 3.0
+        self.completed_challenge_keys.add(ch.key)
+        if ch.reward_type == 'cosmetic' and ch.reward_key:
+            self.cosmetics.add(ch.reward_key)
+            self.log(f"Challenge '{ch.name}' done! Reward: {ch.reward_name}", C_CON_GRN)
+        elif ch.reward_type == 'decoration' and ch.reward_key:
+            self.decorations.add(ch.reward_key)
+            self.log(f"Challenge '{ch.name}' done! Reward: {ch.reward_name}", C_CON_GRN)
+        elif ch.reward_type == 'points':
+            bonus = {'master_coder': 50, 'century': 25, 'scanner': 20}.get(ch.key, 15)
+            self.points += bonus
+            self.total_points_earned += bonus
+            self.log(f"Challenge '{ch.name}' done! Reward: +{bonus} pts", C_CON_GRN)
+
+    def update_challenges(self):
+        for i, ch in enumerate(self.active_challenges):
+            if ch.completed:
+                continue
+            prog = self._get_ch_progress(ch)
+            ch.progress = prog
+            if prog >= ch.goal:
+                self._complete_challenge(i)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sandbox executor
@@ -688,6 +897,14 @@ def build_sandbox(queue: deque, state: GameState) -> dict:
     if 'for_loop' in state.unlocked_cmds:
         ns['range'] = range
 
+    # scan / teleport / auto_harvest are always available
+    def scan(): queue.append(('scan',))
+    def teleport(row, col): queue.append(('teleport', int(row), int(col)))
+    def auto_harvest(): queue.append(('auto_harvest',))
+    ns['scan'] = scan
+    ns['teleport'] = teleport
+    ns['auto_harvest'] = auto_harvest
+
     return ns
 
 def run_player_code(code: str, state: GameState):
@@ -696,6 +913,31 @@ def run_player_code(code: str, state: GameState):
     state.anim_type    = 'none'
     state.anim_elapsed = 0.0
     state.robot.snap_to(state.grid)
+    # Reset per-run counters
+    state.run_harvest_count  = 0
+    state.run_pumpkin_count  = 0
+    state.run_wheat_count    = 0
+    state.run_action_count   = 0
+    state.run_tiles_visited  = set()
+    state.run_has_for        = False
+    state.run_has_while      = False
+    state.run_has_def        = False
+    state.run_teleport_count = 0
+    state.run_scan_count     = 0
+    state._efficient_done    = False
+    state._explorer_done     = False
+    state._programmer_done   = False
+    state._pumpkin_rush_done = False
+    state._master_coder_done = False
+    # Detect AST patterns for challenges
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.For):    state.run_has_for   = True
+            if isinstance(node, ast.While):  state.run_has_while = True
+            if isinstance(node, ast.FunctionDef): state.run_has_def = True
+    except SyntaxError:
+        pass
     lock_err = _check_syntax_locks(code, state.unlocked_cmds)
     if lock_err:
         state.log(f"Locked: {lock_err}", C_CON_RED)
@@ -1226,8 +1468,10 @@ class Renderer:
 
     # ── top-down robot ────────────────────────────────────────────────────────
 
-    def draw_robot(self, robot: Robot, anim_type: str, t_raw: float):
+    def draw_robot(self, robot: Robot, anim_type: str, t_raw: float,
+                   cosmetics: set = None, tod: float = 0.25):
         s   = self.screen
+        cos = cosmetics or set()
         bob = int(-math.sin(t_raw * math.pi) * 3) if anim_type == 'move' else 0
         cx  = int(robot.px)
         cy  = int(robot.py) + bob
@@ -1236,41 +1480,97 @@ class Renderer:
         s.blit(self._robot_shadow, (cx - 20, cy + 4))
 
         # ── Body / overalls ───────────────────────────────────────────────────
-        # Base dark layer
-        pygame.draw.ellipse(s, (38, 58,  96), (cx - 10, cy - 6, 20, 16))
-        # Main denim blue
-        pygame.draw.ellipse(s, (60, 94, 148), (cx -  9, cy - 7, 18, 14))
-        # Shoulder highlight
-        pygame.draw.ellipse(s, (80, 118, 172), (cx - 6, cy - 8, 12, 8))
-        # Central bib stripe
-        pygame.draw.ellipse(s, (92, 132, 182), (cx - 3, cy - 7,  6, 6))
+        if 'overalls_blue' in cos:
+            body_colors = ((18, 42, 90), (30, 72, 160), (50, 100, 200), (70, 120, 220))
+        else:
+            body_colors = ((38, 58, 96), (60, 94, 148), (80, 118, 172), (92, 132, 182))
+        pygame.draw.ellipse(s, body_colors[0], (cx - 10, cy - 6, 20, 16))
+        pygame.draw.ellipse(s, body_colors[1], (cx -  9, cy - 7, 18, 14))
+        pygame.draw.ellipse(s, body_colors[2], (cx - 6, cy - 8, 12, 8))
+        pygame.draw.ellipse(s, body_colors[3], (cx - 3, cy - 7,  6, 6))
+
+        # ── Red scarf ─────────────────────────────────────────────────────────
+        if 'scarf_red' in cos:
+            pygame.draw.ellipse(s, (160, 30, 20), (cx - 9, cy - 4, 18, 7))
+            pygame.draw.ellipse(s, (200, 50, 40), (cx - 7, cy - 5, 14, 5))
 
         # ── Straw hat ─────────────────────────────────────────────────────────
-        # Wide brim — 3 layered ellipses for soft edge
-        pygame.draw.ellipse(s, (132,  96, 26), (cx - 18, cy - 23, 36, 23))   # outermost shadow
-        pygame.draw.ellipse(s, (158, 120, 40), (cx - 17, cy - 25, 34, 22))   # mid brim
-        pygame.draw.ellipse(s, (178, 142, 54), (cx - 14, cy - 26, 28, 21))   # inner brim lit
-
-        # Dome — elevated above brim
-        pygame.draw.ellipse(s, (148, 112, 32), (cx - 10, cy - 31, 20, 17))   # dome shadow
-        pygame.draw.ellipse(s, (186, 152, 52), (cx -  9, cy - 32, 18, 16))   # dome main
-        pygame.draw.ellipse(s, (208, 176, 72), (cx -  5, cy - 33,  9,  9))   # dome highlight
-
-        # Hat band (dark reddish-brown stripe)
-        pygame.draw.ellipse(s, ( 82,  46, 18), (cx - 11, cy - 18, 22,  7))
-        pygame.draw.ellipse(s, ( 98,  58, 26), (cx - 10, cy - 19, 20,  6))
+        if 'hat_orange' in cos:
+            hat_c = [(110, 58, 10), (170, 90, 20), (200, 120, 30), (120, 70, 18), (150, 100, 28), (180, 140, 60), (60, 30, 8), (80, 46, 16)]
+        elif 'hat_dark' in cos:
+            hat_c = [(20, 18, 16), (40, 35, 28), (60, 50, 38), (28, 22, 16), (50, 40, 30), (70, 60, 48), (14, 10, 6), (26, 20, 12)]
+        else:
+            hat_c = [(132, 96, 26), (158, 120, 40), (178, 142, 54), (148, 112, 32), (186, 152, 52), (208, 176, 72), (82, 46, 18), (98, 58, 26)]
+        # Wide brim
+        pygame.draw.ellipse(s, hat_c[0], (cx - 18, cy - 23, 36, 23))
+        pygame.draw.ellipse(s, hat_c[1], (cx - 17, cy - 25, 34, 22))
+        pygame.draw.ellipse(s, hat_c[2], (cx - 14, cy - 26, 28, 21))
+        # Dome
+        pygame.draw.ellipse(s, hat_c[3], (cx - 10, cy - 31, 20, 17))
+        pygame.draw.ellipse(s, hat_c[4], (cx -  9, cy - 32, 18, 16))
+        pygame.draw.ellipse(s, hat_c[5], (cx -  5, cy - 33,  9,  9))
+        # Hat band
+        pygame.draw.ellipse(s, hat_c[6], (cx - 11, cy - 18, 22,  7))
+        pygame.draw.ellipse(s, hat_c[7], (cx - 10, cy - 19, 20,  6))
 
         # ── Face direction dot on brim edge ───────────────────────────────────
         ar  = math.radians(robot.visual_angle)
         fr  = 12.0
         fdx = math.cos(ar) * fr
-        fdy = math.sin(ar) * fr * 0.55    # squash y for tilt perspective
+        fdy = math.sin(ar) * fr * 0.55
         fx  = int(cx + fdx)
         fy  = int(cy - 22 + fdy)
-        # Warm skin-tone face peek
-        pygame.draw.circle(s, (200, 155, 100), (fx, fy), 4)
-        pygame.draw.circle(s, (178, 130,  78), (fx, fy), 2)
-        pygame.draw.circle(s, ( 60,  36,  14), (fx, fy), 1)
+        if 'golden_skin' in cos:
+            skin_c = ((220, 180, 60), (200, 155, 40), (120, 80, 10))
+        else:
+            skin_c = ((200, 155, 100), (178, 130, 78), (60, 36, 14))
+        pygame.draw.circle(s, skin_c[0], (fx, fy), 4)
+        pygame.draw.circle(s, skin_c[1], (fx, fy), 2)
+        pygame.draw.circle(s, skin_c[2], (fx, fy), 1)
+
+        # ── Lantern (night only) ──────────────────────────────────────────────
+        if 'lantern' in cos and tod > 0.45:
+            lx, ly = cx + 10, cy - 2
+            # Glow halo
+            glow = pygame.Surface((26, 26), pygame.SRCALPHA)
+            night_alpha = min(180, int(_night_alpha(tod) * 1.2))
+            pygame.draw.circle(glow, (255, 200, 80, night_alpha // 2), (13, 13), 13)
+            s.blit(glow, (lx - 13, ly - 13))
+            pygame.draw.circle(s, (200, 140, 30), (lx, ly), 4)
+            pygame.draw.circle(s, (255, 200, 80), (lx, ly), 2)
+
+    def _draw_scarecrow(self, vrec: pygame.Rect):
+        s  = self.screen
+        sx = vrec.right + 22
+        sy = vrec.centery - 10
+        # Post
+        pygame.draw.rect(s, (90, 60, 20), (sx - 2, sy - 10, 4, 32))
+        # Crossbar
+        pygame.draw.rect(s, (110, 75, 28), (sx - 14, sy, 28, 4))
+        # Straw hat
+        pygame.draw.ellipse(s, (158, 120, 40), (sx - 10, sy - 22, 20, 12))
+        pygame.draw.ellipse(s, (178, 142, 54), (sx - 7, sy - 24, 14, 10))
+        # Face
+        pygame.draw.circle(s, (220, 180, 100), (sx, sy - 12), 6)
+        pygame.draw.circle(s, (60, 36, 14), (sx - 2, sy - 13), 1)
+        pygame.draw.circle(s, (60, 36, 14), (sx + 2, sy - 13), 1)
+        # Shirt
+        pygame.draw.ellipse(s, (160, 40, 20), (sx - 8, sy + 4, 16, 12))
+
+    def _draw_well(self, vrec: pygame.Rect):
+        s  = self.screen
+        sx = vrec.left - 28
+        sy = vrec.centery + 20
+        # Stone base
+        pygame.draw.ellipse(s, (80, 72, 64), (sx - 16, sy - 4, 32, 14))
+        pygame.draw.ellipse(s, (100, 92, 82), (sx - 14, sy - 6, 28, 12))
+        # Well posts
+        pygame.draw.rect(s, (60, 45, 28), (sx - 14, sy - 20, 4, 18))
+        pygame.draw.rect(s, (60, 45, 28), (sx + 10, sy - 20, 4, 18))
+        # Roof beam
+        pygame.draw.rect(s, (80, 55, 30), (sx - 15, sy - 24, 30, 5))
+        # Rope
+        pygame.draw.line(s, (120, 90, 40), (sx, sy - 22), (sx, sy - 6), 2)
 
     # ── top-down environment ──────────────────────────────────────────────────
 
@@ -1466,8 +1766,8 @@ class Renderer:
         # Tab row
         tab_y   = SHOP_Y + 38
         tab_h   = 32
-        tab_w   = SHOP_W // 3
-        tab_labels = ["Grid", "Crops", "Commands"]
+        tab_w   = SHOP_W // 4
+        tab_labels = ["Grid", "Crops", "Commands", "Challenges"]
         self.shop_tab_rects = []
         for i, lbl in enumerate(tab_labels):
             tr = pygame.Rect(SHOP_X + i * tab_w, tab_y, tab_w, tab_h)
@@ -1489,8 +1789,10 @@ class Renderer:
             self._draw_shop_grid_tab(s, content_y, content_h, state, mouse_pos)
         elif state.shop_tab == 1:
             self._draw_shop_crops_tab(s, content_y, content_h)
-        else:
+        elif state.shop_tab == 2:
             self._draw_shop_cmds_tab(s, content_y, content_h, state, mouse_pos)
+        else:
+            self._draw_shop_challenges_tab(s, content_y, content_h, state)
 
         # Footer
         foot = self.font_label.render(
@@ -1646,6 +1948,85 @@ class Renderer:
             pygame.draw.rect(s, (40, 28, 16), (sb_x, cy, 8, ch), border_radius=4)
             pygame.draw.rect(s, C_WARM_GRY,   (sb_x, thumb_y, 8, thumb_h), border_radius=4)
 
+    def _draw_shop_challenges_tab(self, s, cy, ch, state: GameState):
+        x0   = SHOP_X + 16
+        row_h = 90
+        pad   = 8
+
+        completed_total = len(state.completed_challenge_keys)
+        hdr = self.font_ui.render(
+            f"Active Challenges  ·  Completed: {completed_total}/{len(CHALLENGE_POOL)}",
+            True, C_WARM_WHT)
+        s.blit(hdr, (x0, cy + 6))
+
+        clip_rect = pygame.Rect(SHOP_X, cy + 30, SHOP_W, ch - 30)
+        s.set_clip(clip_rect)
+
+        scroll = state.shop_ch_scroll
+        y = cy + 34 - scroll
+
+        for ch_obj in state.active_challenges:
+            row = pygame.Rect(SHOP_X + 8, y, SHOP_W - 16, row_h)
+            if row.bottom < clip_rect.top or row.top > clip_rect.bottom:
+                y += row_h + pad
+                continue
+
+            # Flash completed rows green
+            if ch_obj.completed and ch_obj.flash_timer > 0:
+                alpha = int(min(1.0, ch_obj.flash_timer) * 80)
+                flash_surf = pygame.Surface((row.w, row.h), pygame.SRCALPHA)
+                flash_surf.fill((60, 200, 80, alpha))
+                bg_col = (38, 52, 38)
+            elif ch_obj.completed:
+                bg_col = (28, 42, 28)
+            else:
+                bg_col = (26, 22, 14)
+
+            pygame.draw.rect(s, bg_col, row, border_radius=6)
+            if ch_obj.completed and ch_obj.flash_timer > 0:
+                s.blit(flash_surf, row.topleft)
+            pygame.draw.rect(s, C_WOOD_LT, row, 1, border_radius=6)
+
+            # Name
+            name_col = C_GOLD if not ch_obj.completed else (120, 200, 90)
+            name_surf = self.font_ui.render(ch_obj.name, True, name_col)
+            s.blit(name_surf, (row.x + 12, row.y + 10))
+
+            # Description
+            desc_surf = self.font_label.render(ch_obj.desc, True, C_WARM_GRY)
+            s.blit(desc_surf, (row.x + 12, row.y + 30))
+
+            # Reward
+            rew_surf = self.font_small.render(
+                f"Reward: {ch_obj.reward_name}", True, (180, 160, 90))
+            s.blit(rew_surf, (row.x + 12, row.y + 48))
+
+            # Progress bar
+            prog = min(ch_obj.progress, ch_obj.goal)
+            bar_x = row.x + 12
+            bar_y = row.y + row_h - 16
+            bar_w = row.w - 24
+            bar_h = 8
+            pygame.draw.rect(s, (40, 28, 16), (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+            if ch_obj.goal > 0:
+                fill_w = int(bar_w * prog / ch_obj.goal)
+                if fill_w > 0:
+                    fill_col = (80, 180, 60) if not ch_obj.completed else (60, 200, 80)
+                    pygame.draw.rect(s, fill_col, (bar_x, bar_y, fill_w, bar_h), border_radius=4)
+            prog_lbl = self.font_small.render(
+                f"{prog}/{ch_obj.goal}" + ("  ✓" if ch_obj.completed else ""), True,
+                (140, 200, 100) if ch_obj.completed else C_WARM_GRY)
+            s.blit(prog_lbl, (bar_x + bar_w - prog_lbl.get_width(), bar_y - 14))
+
+            y += row_h + pad
+
+        # Completed note
+        if not state.active_challenges:
+            note = self.font_ui.render("All challenges complete!", True, C_GOLD)
+            s.blit(note, (SHOP_X + (SHOP_W - note.get_width()) // 2, cy + 80))
+
+        s.set_clip(None)
+
     # ── main draw call ────────────────────────────────────────────────────────
 
     def draw(self, state: GameState,
@@ -1675,7 +2056,14 @@ class Renderer:
 
         # Robot drawn last (flat grid — always on top of tiles)
         _t_raw = min(1.0, state.anim_elapsed / state.anim_duration) if (state.animating and state.anim_duration > 0) else 0.0
-        self.draw_robot(state.robot, state.anim_type if state.animating else 'none', _t_raw)
+        self.draw_robot(state.robot, state.anim_type if state.animating else 'none', _t_raw,
+                        cosmetics=state.cosmetics, tod=state.time_of_day)
+        # Decorations
+        vrec = state.grid.visual_rect()
+        if 'scarecrow' in state.decorations:
+            self._draw_scarecrow(vrec)
+        if 'well' in state.decorations:
+            self._draw_well(vrec)
 
         # Night overlay (after tiles + robot, before UI labels)
         _nalpha = _night_alpha(state.time_of_day)
@@ -1915,6 +2303,11 @@ def main():
                     state.shop_cmd_scroll = max(
                         0, min(_SHOP_CMD_MAX_SCROLL,
                                state.shop_cmd_scroll - event.y * 20))
+                elif state.shop_open and state.shop_tab == 3:
+                    max_ch_scroll = max(0, len(state.active_challenges) * 98 - 240)
+                    state.shop_ch_scroll = max(
+                        0, min(max_ch_scroll,
+                               state.shop_ch_scroll - event.y * 20))
 
         # ── animation update (paused when shop is open) ──────────────────────
         robot = state.robot
@@ -1950,9 +2343,18 @@ def main():
                 action = state.action_queue.popleft()
                 state.dispatch(action)
                 sound_mgr.play_for_dispatch(action, state.anim_type)
+                state.update_challenges()
             else:
                 state.running = False
                 state.log("Done.", C_CON_GRY)
+                state.update_challenges()
+
+        # ── challenge flash timer tick ────────────────────────────────────────
+        for i, ch in enumerate(state.active_challenges):
+            if ch.flash_timer > 0:
+                ch.flash_timer = max(0.0, ch.flash_timer - dt)
+                if ch.flash_timer <= 0:
+                    state._replace_challenge(i)
 
         # ── draw ─────────────────────────────────────────────────────────────
         renderer.draw(state, editor, console, btn_rect, btn_hover, mouse_pos)
