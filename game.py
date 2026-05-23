@@ -1,3 +1,4 @@
+import ast
 import sys
 import math
 from collections import deque
@@ -346,6 +347,84 @@ def tile_cost(tiles_purchased: int) -> int:
         cost = round(cost * 1.5)
     return cost
 
+CMD_PRICES: dict = {
+    'repeat':        10,
+    'if_crop_ready': 10,
+    'face':          10,
+    'variables':     35,
+    'is_soil':       20,
+    'is_blocked':    20,
+    'crop_type':     25,
+    'position':      20,
+    'count':         25,
+    'for_loop':      40,
+    'while_loop':    50,
+    'if_else':       45,
+    'def_func':      60,
+}
+
+SHOP_CMDS: list = [
+    ("Basics", [
+        ('repeat',        'repeat(n, [cmd, …])',
+         'Repeats a list of commands n times.',
+         'repeat(3, [move, harvest])'),
+        ('if_crop_ready', 'if_crop_ready()',
+         'Returns True if current tile has a crop ready to harvest.',
+         'if if_crop_ready(): harvest()'),
+        ('face',          'face(direction)',
+         'Instantly faces the robot in a cardinal direction.',
+         'face("north")'),
+    ]),
+    ("Awareness", [
+        ('is_soil',    'is_soil()',
+         'Returns True if the current tile is empty plantable soil.',
+         'if is_soil(): plant()'),
+        ('is_blocked', 'is_blocked()',
+         'Returns True if the tile ahead is a wall or off-grid.',
+         'if not is_blocked(): move()'),
+        ('crop_type',  'crop_type()',
+         'Returns the crop name on the current tile, or None.',
+         'if crop_type() == "carrot": harvest()'),
+        ('position',   'position()',
+         'Returns (row, col) of the robot.',
+         'r, c = position()'),
+        ('count',      'count()',
+         'Returns how many tiles currently have a ready crop.',
+         'if count() > 0: harvest()'),
+    ]),
+    ("Control Flow", [
+        ('for_loop',   'for i in range(n):',
+         'Standard Python for-loop. Also unlocks range().',
+         'for i in range(3): move()'),
+        ('while_loop', 'while <condition>:',
+         'Standard Python while-loop.',
+         'while not is_blocked(): move()'),
+        ('if_else',    'if / else',
+         'Standard Python if/else branching.',
+         'if is_soil(): plant()'),
+        ('variables',  'x = value',
+         'Assign and use variables (except crop = "name").',
+         'n = 4'),
+    ]),
+    ("Functions", [
+        ('def_func',   'def name():',
+         'Define reusable functions.',
+         'def farm(): plant()'),
+    ]),
+]
+
+_SHOP_CMD_ROW_H      = 84
+_SHOP_CMD_ROW_GAP    = 4
+_SHOP_CMD_SEC_H      = 22
+_SHOP_CMD_SEC_GAP    = 6
+_SHOP_CMD_CONTENT_H  = SHOP_H - 38 - 32 - 4 - 28   # 398
+_SHOP_CMD_TOTAL_H    = sum(
+    (_SHOP_CMD_SEC_H + _SHOP_CMD_SEC_GAP if title else 0)
+    + len(items) * (_SHOP_CMD_ROW_H + _SHOP_CMD_ROW_GAP)
+    for title, items in SHOP_CMDS
+)
+_SHOP_CMD_MAX_SCROLL = max(0, _SHOP_CMD_TOTAL_H - _SHOP_CMD_CONTENT_H)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Robot
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,7 +479,8 @@ class GameState:
         self.tiles_purchased = 0
         self.unlocked_cmds: set = set()   # 'repeat', 'if_crop_ready', 'face'
         self.shop_open = False
-        self.shop_tab  = 0                # 0=Grid 1=Crops 2=Commands
+        self.shop_tab        = 0     # 0=Grid 1=Crops 2=Commands
+        self.shop_cmd_scroll = 0
         # Day / night
         self.time_of_day  = 0.0   # 0=dawn 0.25=midday 0.5=dusk 0.75=midnight
         self.total_time   = 0.0   # real seconds elapsed
@@ -520,6 +600,31 @@ class GameState:
 # ─────────────────────────────────────────────────────────────────────────────
 # Sandbox executor
 # ─────────────────────────────────────────────────────────────────────────────
+def _check_syntax_locks(code: str, unlocked: set) -> str:
+    """Return an error string if code uses a locked syntax feature, else ''."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ''   # SyntaxError reported later by exec
+    for node in ast.walk(tree):
+        if isinstance(node, ast.For) and 'for_loop' not in unlocked:
+            return "for-loop is locked — unlock it in the shop"
+        if isinstance(node, ast.While) and 'while_loop' not in unlocked:
+            return "while-loop is locked — unlock it in the shop"
+        if isinstance(node, ast.If) and 'if_else' not in unlocked:
+            return "if/else is locked — unlock it in the shop"
+        if isinstance(node, ast.FunctionDef) and 'def_func' not in unlocked:
+            return "def is locked — unlock it in the shop"
+        if 'variables' not in unlocked:
+            if isinstance(node, ast.AugAssign):
+                return "variables are locked — unlock in the shop"
+            if isinstance(node, ast.Assign):
+                tgts = node.targets
+                if not (len(tgts) == 1 and isinstance(tgts[0], ast.Name)
+                        and tgts[0].id == 'crop'):
+                    return "variables are locked — unlock in the shop"
+    return ''
+
 def build_sandbox(queue: deque, state: GameState) -> dict:
     ns = {'crop': 'carrot', '__builtins__': {}}
 
@@ -549,6 +654,40 @@ def build_sandbox(queue: deque, state: GameState) -> dict:
         def face(d): queue.append(('face', d))
         ns['face'] = face
 
+    if 'is_soil' in state.unlocked_cmds:
+        def is_soil():
+            t = state.grid.get(state.robot.row, state.robot.col)
+            return t is not None and t.state == TileState.EMPTY
+        ns['is_soil'] = is_soil
+
+    if 'is_blocked' in state.unlocked_cmds:
+        def is_blocked():
+            dr, dc = state.robot.direction.value
+            nr, nc = state.robot.row + dr, state.robot.col + dc
+            t = state.grid.get(nr, nc)
+            return t is None or t.state == TileState.OBSTACLE
+        ns['is_blocked'] = is_blocked
+
+    if 'crop_type' in state.unlocked_cmds:
+        def crop_type():
+            t = state.grid.get(state.robot.row, state.robot.col)
+            return t.crop_type if t is not None else None
+        ns['crop_type'] = crop_type
+
+    if 'position' in state.unlocked_cmds:
+        def position():
+            return (state.robot.row, state.robot.col)
+        ns['position'] = position
+
+    if 'count' in state.unlocked_cmds:
+        def count():
+            return sum(1 for t in state.grid.tiles.values()
+                       if t.state == TileState.READY)
+        ns['count'] = count
+
+    if 'for_loop' in state.unlocked_cmds:
+        ns['range'] = range
+
     return ns
 
 def run_player_code(code: str, state: GameState):
@@ -557,6 +696,10 @@ def run_player_code(code: str, state: GameState):
     state.anim_type    = 'none'
     state.anim_elapsed = 0.0
     state.robot.snap_to(state.grid)
+    lock_err = _check_syntax_locks(code, state.unlocked_cmds)
+    if lock_err:
+        state.log(f"Locked: {lock_err}", C_CON_RED)
+        return
     sandbox = build_sandbox(state.action_queue, state)
     try:
         exec(compile(code, '<editor>', 'exec'), sandbox)
@@ -587,15 +730,16 @@ def handle_buy(key: str, state: GameState):
                       f"{state.grid.rows}x{state.grid.cols}", C_CON_GRN)
         else:
             state.log(f"Need {cost} pts to buy next tile.", C_CON_RED)
-    elif key in ('repeat', 'if_crop_ready', 'face'):
+    elif key in CMD_PRICES:
+        cost = CMD_PRICES[key]
         if key in state.unlocked_cmds:
-            state.log(f"{key}() is already unlocked.", C_CON_GRY)
-        elif state.points >= 10:
-            state.points -= 10
+            state.log(f"{key} is already unlocked.", C_CON_GRY)
+        elif state.points >= cost:
+            state.points -= cost
             state.unlocked_cmds.add(key)
-            state.log(f"Unlocked {key}()!", C_CON_GRN)
+            state.log(f"Unlocked {key}!", C_CON_GRN)
         else:
-            state.log("Need 10 pts to unlock a command.", C_CON_RED)
+            state.log(f"Need {cost} pts to unlock {key}.", C_CON_RED)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Editor Component  (unchanged)
@@ -738,7 +882,6 @@ class Renderer:
         self.font_big   = pygame.font.SysFont("sans", 24, bold=True)
         self.font_label = pygame.font.SysFont("monospace", 13)
         self.font_small = pygame.font.SysFont("monospace", 12)
-        self._soil_dots: dict = {}
         self._overlay   = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         self._overlay.fill((0, 0, 0, 165))
         self.shop_tab_rects: list = []
@@ -747,233 +890,452 @@ class Renderer:
         self._sky_surf = pygame.Surface((PANEL_W, WIN_H))
         self._sky_tod  = -1.0   # force redraw on first frame
         self._night_ov = pygame.Surface((PANEL_W, WIN_H), pygame.SRCALPHA)
+        # Per-tile baked surfaces (pre-rendered once, keyed by (r,c,state_key))
+        self._tile_surf_cache: dict = {}
+        # Pre-rendered robot ground shadow
+        _sh = pygame.Surface((40, 16), pygame.SRCALPHA)
+        for _sw, _ssh, _sa in [(40, 16, 55), (32, 12, 80), (22, 8, 105)]:
+            pygame.draw.ellipse(_sh, (8, 4, 0, _sa),
+                                (20 - _sw//2, 8 - _ssh//2, _sw, _ssh))
+        self._robot_shadow = _sh
 
     # ── top-down tile rendering ───────────────────────────────────────────────
 
-    def _get_tile_dots(self, r: int, c: int) -> list:
-        """Stable per-tile texture dots scattered within the rectangle."""
-        if (r, c) in self._soil_dots:
-            return self._soil_dots[(r, c)]
-        dots = []
-        h = r * 0x6B + c * 0xA3 + 0xFF
-        for _ in range(60):
-            h = (h * 0x41C6 + 0x3039) & 0xFFFF
-            dx = (h % (TILE_W - 8)) + 4
-            h = (h * 0x41C6 + 0x3039) & 0xFFFF
-            dy = (h % (TILE_H - 8)) + 4
-            h = (h * 0x41C6 + 0x3039) & 0xFFFF
-            col = C_SOIL_LT if h % 3 != 0 else C_SOIL_DK
-            dots.append((dx, dy, col))
-            if len(dots) >= 10:
-                break
-        self._soil_dots[(r, c)] = dots
-        return dots
+    def _bake_tile(self, r: int, c: int, state_key: str) -> pygame.Surface:
+        """Pre-render a tile's static base to a Surface (called once per tile/state)."""
+        surf = pygame.Surface((TILE_W, TILE_H))
+
+        # Fast integer LCG seeded by tile position
+        h = (r * 73856093 ^ c * 19349663 ^ 83492791) & 0x7FFFFFFF
+        def nxt() -> int:
+            nonlocal h
+            h = (h * 1664525 + 1013904223) & 0x7FFFFFFF
+            return h
+
+        if state_key == 'obs':
+            # ── Stone obstacle ────────────────────────────────────────────────
+            surf.fill((86, 80, 72))
+            grey_vars = [(64, 58, 50), (100, 94, 86), (74, 68, 60), (94, 88, 80), (78, 72, 64)]
+            for _ in range(8):
+                ex = nxt() % (TILE_W - 14) + 7
+                ey = nxt() % (TILE_H - 10) + 5
+                ew = nxt() % 18 + 8
+                eh = nxt() % 10 + 5
+                pygame.draw.ellipse(surf, grey_vars[nxt() % 5],
+                                    (ex - ew//2, ey - eh//2, ew, eh))
+            # Crack lines
+            for _ in range(4):
+                x1 = nxt() % (TILE_W - 16) + 8
+                y1 = nxt() % (TILE_H - 12) + 6
+                x2 = x1 + (nxt() % 16) - 8
+                y2 = y1 + (nxt() % 12) - 6
+                pygame.draw.aaline(surf, (48, 42, 36), (x1, y1), (x2, y2))
+            # Lit far edge (top 2 rows)
+            pygame.draw.rect(surf, (98, 92, 84), (0, 0, TILE_W, 2))
+            pygame.draw.rect(surf, (102, 96, 88), (0, 0, TILE_W, 1))
+            # Depth strip gradient
+            for i in range(TILE_DEPTH):
+                t = i / max(1, TILE_DEPTH - 1)
+                dc = _lerp_c((54, 48, 42), (34, 28, 22), t)
+                pygame.draw.rect(surf, dc, (0, TILE_H - TILE_DEPTH + i, TILE_W, 1))
+
+        else:
+            # ── Soil tile ─────────────────────────────────────────────────────
+            wet = (state_key == 'wet')
+            if wet:
+                base = (72, 48, 26)
+                var_cols = [(54, 34, 16), (86, 60, 34), (64, 42, 22), (78, 54, 30),
+                            (58, 38, 18), (90, 64, 38)]
+                hi_col   = (84, 58, 32)
+                far_edge = (46, 26, 10)
+                dep0     = (56, 34, 14)
+            else:
+                base = (100, 70, 44)
+                var_cols = [(76, 50, 28), (122, 90, 58), (88, 62, 38), (112, 82, 54),
+                            (80, 56, 32), (116, 86, 56)]
+                hi_col   = (116, 86, 56)
+                far_edge = (62, 40, 20)
+                dep0     = (70, 46, 24)
+
+            surf.fill(base)
+
+            # Large organic variation patches (9 ellipses)
+            for _ in range(9):
+                ex = nxt() % (TILE_W - 12) + 6
+                ey = nxt() % (TILE_H -  8) + 4
+                ew = nxt() % 24 + 10
+                eh = nxt() % 14 +  5
+                pygame.draw.ellipse(surf, var_cols[nxt() % 6],
+                                    (ex - ew//2, ey - eh//2, ew, eh))
+
+            # Small texture pebbles/dirt clods (14 scattered dots)
+            for _ in range(14):
+                px = nxt() % (TILE_W - 6) + 3
+                py = nxt() % (TILE_H - 6) + 3
+                pr = nxt() % 3 + 1
+                pygame.draw.circle(surf, var_cols[nxt() % 6], (px, py), pr)
+
+            # Soft upper-left highlight (3 nested ellipses, decreasing)
+            for i in range(3):
+                hw = max(4, TILE_W // 3 - i * 7)
+                hh = max(3, TILE_H // 3 - i * 5)
+                pygame.draw.ellipse(surf, hi_col,
+                                    (TILE_W // 5 - hw//2, TILE_H // 6 - hh//2, hw, hh))
+
+            # Far edge shadow: top 3 rows, darkening toward y=0
+            for i in range(3):
+                dv = 16 * (3 - i)
+                dc = (max(0, far_edge[0]-dv), max(0, far_edge[1]-dv), max(0, far_edge[2]-dv))
+                pygame.draw.rect(surf, dc, (0, i, TILE_W, 1))
+
+            # Depth strip: gradient from dep0 to nearly-black
+            for i in range(TILE_DEPTH):
+                t  = i / max(1, TILE_DEPTH - 1)
+                dc = _lerp_c(dep0, (36, 20, 6), t)
+                pygame.draw.rect(surf, dc, (0, TILE_H - TILE_DEPTH + i, TILE_W, 1))
+
+        return surf
 
     def _draw_sprout(self, sx: int, sy: int, tile):
-        """Growing plant seen from slightly-tilted top-down."""
-        s  = self.screen
-        cx = sx + TILE_W // 2
-        cy = sy + TILE_H // 2 - 4
+        """Growing plant — 3 stages, layered organic shapes."""
+        s    = self.screen
+        cx   = sx + TILE_W // 2
+        cy   = sy + TILE_H // 2 - 4
         crop = CROPS.get(tile.crop_type, CROPS['carrot'])
         prog = max(0.0, 1.0 - tile.growth_turns / max(1, crop.turns))
-        r_base = int(4 + prog * 9)   # radius grows with progress
 
         if tile.crop_type == 'wheat':
-            # Spreading cluster of tiny stalks viewed from above
-            for i, (dx, dy) in enumerate([(-5,0),(5,0),(0,-5),(0,5),(-4,-4),(4,-4)]):
-                if i / 6 > prog + 0.15: break
-                pygame.draw.circle(s, C_STEM_DK, (cx+dx, cy+dy), 2)
-                pygame.draw.circle(s, C_STEM_LT, (cx+dx, cy+dy), 1)
+            # Stage 1 (<0.4): sparse tiny green nubs
+            # Stage 2 (0.4–0.75): growing shoots with stems
+            # Stage 3 (>0.75): golden heads just forming
+            num = max(2, int(prog * 8) + 2)
+            for i in range(num):
+                ang  = math.radians(i * (360 / num) + 12)
+                rad  = 3 + prog * 8
+                tx   = int(cx + math.cos(ang) * rad)
+                ty   = int(cy + math.sin(ang) * rad * 0.65)
+                ht   = max(2, int(3 + prog * 5))
+                if prog > 0.7:
+                    gcol = _lerp_c((60, 108, 30), (190, 155, 45), (prog - 0.7) / 0.3)
+                else:
+                    gcol = (55 + int(prog*30), 108 + int(prog*10), 28)
+                pygame.draw.line(s, (36, 76, 18), (tx, ty), (tx, ty - ht), 1)
+                pygame.draw.circle(s, gcol, (tx, ty - ht), 1 + (1 if prog > 0.6 else 0))
+
         elif tile.crop_type == 'pumpkin':
-            # Small green shoot blob
-            pygame.draw.circle(s, C_STEM_DK, (cx, cy), r_base)
-            pygame.draw.circle(s, C_STEM,    (cx, cy), max(1, r_base - 2))
+            # Stage 1: 2 small leaf lobes
+            # Stage 2: spreading vine cluster + orange hint
+            # Stage 3: large orange blob with green
+            r_base = int(2 + prog * 9)
+            g_dk   = (38, 88, 22)
+            g_main = (56 + int(prog*16), 118 - int(prog*8), 32)
+            # Green shoot lobes
+            for i in range(max(1, int(prog * 4) + 1)):
+                ang = math.radians(i * (360 / max(1, int(prog*4)+1)) + 20)
+                ox  = int(math.cos(ang) * r_base * 0.5)
+                oy  = int(math.sin(ang) * r_base * 0.4)
+                pygame.draw.circle(s, g_dk,   (cx+ox+1, cy+oy+1), r_base)
+                pygame.draw.circle(s, g_main, (cx+ox,   cy+oy),   r_base)
+            # Orange tinge grows from stage 2 onward
+            if prog > 0.35:
+                t_o = (prog - 0.35) / 0.65
+                oc  = int(t_o * 150)
+                pygame.draw.circle(s, (100 + oc, 50 + oc//3, 10), (cx, cy), max(1, int(r_base*0.75)))
+
         else:  # carrot
-            # Tuft of leaves viewed from above
-            for dx, dy in ((-3,-3),(3,-3),(0,4),(-4,1),(4,1)):
-                pygame.draw.ellipse(s, C_LEAF_DK, (cx+dx-3, cy+dy-2, 6, 4))
-            pygame.draw.circle(s, C_LEAF, (cx, cy), max(2, r_base - 3))
+            # Feathery leaf crown growing outward
+            num = max(2, int(prog * 6) + 2)
+            for i in range(num):
+                ang = math.radians(i * (360 / num) + 8)
+                r   = max(1, int(2 + prog * 10))
+                lx  = int(cx + math.cos(ang) * r * 0.75)
+                ly  = int(cy + math.sin(ang) * r * 0.55)
+                lw  = max(2, int(2 + prog * 6))
+                lh  = max(1, int(1 + prog * 4))
+                g_dk   = (38, 82, 20)
+                g_main = (60, 116, 34) if i % 2 == 0 else (50, 102, 26)
+                pygame.draw.ellipse(s, g_dk,   (lx - lw//2+1, ly - lh//2+1, lw, lh))
+                pygame.draw.ellipse(s, g_main, (lx - lw//2,   ly - lh//2,   lw, lh))
 
     def _draw_crop(self, sx: int, sy: int, tile):
-        """Full mature crop viewed from slightly-tilted top-down."""
+        """Full mature crop — rich layered painterly shapes."""
         s  = self.screen
         cx = sx + TILE_W // 2
         cy = sy + TILE_H // 2 - 4
 
         if tile.crop_type == 'wheat':
-            # Golden grain cluster — ring of oval heads around centre
-            for ang_deg in range(0, 360, 45):
+            # Warm golden wheat — ring of drooping oval heads with stems
+            stem_col = (68, 110, 38)
+            heads    = [(170, 138, 36), (198, 162, 50), (218, 186, 68)]
+            for j, ang_deg in enumerate(range(0, 360, 40)):
                 ang = math.radians(ang_deg)
-                hx  = int(cx + math.cos(ang) * 9)
-                hy  = int(cy + math.sin(ang) * 7)
-                pygame.draw.ellipse(s, C_WHEAT,    (hx-4, hy-5, 8, 9))
-                pygame.draw.ellipse(s, C_WHEAT_LT, (hx-2, hy-3, 4, 5))
-                pygame.draw.line(s, C_STEM, (cx, cy), (hx, hy), 1)
-            pygame.draw.circle(s, C_STEM_LT, (cx, cy), 4)   # centre
+                r   = 11
+                hx  = int(cx + math.cos(ang) * r)
+                hy  = int(cy + math.sin(ang) * r * 0.68)
+                # Stem
+                pygame.draw.aaline(s, stem_col, (cx, cy), (hx, hy))
+                # Head — 3 layered ellipses for volume
+                pygame.draw.ellipse(s, heads[0], (hx - 5, hy - 6, 10, 12))
+                pygame.draw.ellipse(s, heads[1], (hx - 4, hy - 5,  8, 10))
+                pygame.draw.ellipse(s, heads[2], (hx - 2, hy - 4,  4,  6))
+            # Centre tuft
+            for r_, c_ in [(5, stem_col), (3, (98, 148, 52)), (2, (128, 178, 64))]:
+                pygame.draw.circle(s, c_, (cx, cy), r_)
 
         elif tile.crop_type == 'pumpkin':
-            # Orange disc with 3 radial lobe lines and small stem
-            pygame.draw.circle(s, (160, 80, 20), (cx+2, cy+2), 16)   # shadow
-            pygame.draw.circle(s, C_PUMPKIN,     (cx,   cy),   15)
-            pygame.draw.circle(s, C_PUMPKIN_LT,  (cx-3, cy-3), 7)
-            for ang_deg in (30, 150, 270):
-                ang = math.radians(ang_deg)
-                pygame.draw.line(s, C_PUMPKIN_DK,
-                                 (cx, cy), (int(cx + math.cos(ang)*14), int(cy + math.sin(ang)*13)), 2)
-            pygame.draw.circle(s, C_STEM_DK, (cx, cy-14), 3)   # stem top
+            # Soft cast shadow
+            shad = pygame.Surface((38, 13), pygame.SRCALPHA)
+            pygame.draw.ellipse(shad, (12, 4, 0, 80), (0, 0, 38, 13))
+            s.blit(shad, (cx - 19, cy + 9))
 
-        else:  # carrot — green leafy rosette
-            # Leaf rosette
-            for ang_deg in range(0, 360, 60):
-                ang = math.radians(ang_deg)
-                lx  = int(cx + math.cos(ang) * 10)
-                ly  = int(cy + math.sin(ang) *  8)
-                lc  = C_LEAF if ang_deg % 120 == 0 else C_LEAF_DK
-                pygame.draw.ellipse(s, lc, (lx-5, ly-4, 10, 8))
-            pygame.draw.circle(s, C_LEAF_DK, (cx, cy), 5)
-            pygame.draw.circle(s, (200, 110, 50), (cx, cy), 3)   # orange top hint
+            # 4-lobe pumpkin body: offset ellipses per lobe
+            for la_d in (0, 90, 180, 270):
+                la  = math.radians(la_d)
+                lx_ = int(cx + math.cos(la) * 4)
+                ly_ = int(cy + math.sin(la) * 3)
+                pygame.draw.ellipse(s, (140, 74, 14), (lx_ - 11, ly_ - 9, 22, 18))
+
+            # Main body — 3 layered circles for depth
+            for col, r_ in [((142, 76, 14), 14), ((188, 106, 28), 13), ((212, 130, 42), 11)]:
+                pygame.draw.circle(s, col, (cx, cy), r_)
+
+            # Highlight upper-left
+            pygame.draw.ellipse(s, (236, 162, 64), (cx - 8, cy - 8,  10,  8))
+            pygame.draw.ellipse(s, (252, 190, 88), (cx - 5, cy - 6,   5,  4))
+
+            # Shadow lower-right
+            pygame.draw.ellipse(s, (106, 52,  8), (cx + 3, cy + 4,   9,  7))
+
+            # Lobe divider grooves
+            for la_d in (30, 150, 270):
+                la = math.radians(la_d)
+                pygame.draw.line(s, (120, 60, 10), (cx, cy),
+                                 (int(cx + math.cos(la)*13), int(cy + math.sin(la)*11)), 2)
+
+            # Curling green stem
+            for r_, off, gc in [(4, 0, (44, 94, 22)), (3, -1, (64, 122, 34)), (2, -1, (86, 148, 48))]:
+                pygame.draw.circle(s, gc, (cx + off, cy - 13 + off), r_)
+
+        else:  # carrot — lush layered leaf rosette
+            # Leaf petals — 6 directional leaves with shadow + highlight layers
+            leaf_params = [
+                (0,   13, 10, (48,  96, 24)),
+                (60,  12,  9, (62, 112, 32)),
+                (120, 13, 10, (44,  90, 22)),
+                (180, 12,  9, (66, 118, 36)),
+                (240, 13, 10, (52, 102, 28)),
+                (300, 12,  9, (58, 110, 30)),
+            ]
+            for ang_d, lw, lh, col in leaf_params:
+                ang = math.radians(ang_d)
+                lx  = int(cx + math.cos(ang) * 9)
+                ly  = int(cy + math.sin(ang) * 7)
+                shadow_c = (max(0,col[0]-12), max(0,col[1]-12), max(0,col[2]-6))
+                pygame.draw.ellipse(s, shadow_c, (lx - lw//2+1, ly - lh//2+1, lw, lh))
+                pygame.draw.ellipse(s, col,       (lx - lw//2,   ly - lh//2,   lw, lh))
+
+            # Centre hub layers
+            for r_, c_ in [(6, (48, 96, 24)), (4, (72, 128, 40)), (3, (88, 148, 50))]:
+                pygame.draw.circle(s, c_, (cx, cy), r_)
+
+            # Orange carrot crown hint
+            pygame.draw.circle(s, (195, 108, 38), (cx, cy), 3)
+            pygame.draw.circle(s, (218, 134, 56), (cx, cy), 2)
+            pygame.draw.circle(s, (235, 158, 74), (cx, cy), 1)
 
     def _draw_pips(self, sx: int, sy: int, tile):
-        """Growth progress dots along the bottom edge of the tile."""
+        """Growth progress circles along the bottom edge of the tile."""
         crop_info = CROPS.get(tile.crop_type, CROPS['carrot'])
         total = max(1, crop_info.turns)
         done  = total - tile.growth_turns
         num   = min(total, 6)
-        step  = 8
+        step  = 9
         bx0   = sx + TILE_W // 2 - (num * step) // 2
         by    = sy + TILE_H - TILE_DEPTH - 6
         for i in range(num):
             filled = i < round(done / total * num)
-            col    = C_STEM if filled else C_SOIL_DK
-            pygame.draw.rect(self.screen, col, (bx0 + i * step, by, 5, 4))
+            if filled:
+                pygame.draw.circle(self.screen, (88, 148, 48), (bx0 + i*step + 3, by + 2), 3)
+                pygame.draw.circle(self.screen, (112, 178, 64),(bx0 + i*step + 3, by + 2), 2)
+            else:
+                pygame.draw.circle(self.screen, (58, 36, 16),  (bx0 + i*step + 3, by + 2), 3)
+                pygame.draw.circle(self.screen, (72, 48, 24),  (bx0 + i*step + 3, by + 2), 2)
 
     def _draw_locked(self, sx: int, sy: int):
-        """Locked / purchasable tile — top-down style."""
+        """Locked / purchasable tile — dark textured base + padlock."""
         s  = self.screen
-        r  = pygame.Rect(sx, sy, TILE_W, TILE_H)
-        # Dark fill
-        pygame.draw.rect(s, C_ISO_LOCK_T, r)
-        pygame.draw.rect(s, C_ISO_LOCK_L, (sx, sy + TILE_H - TILE_DEPTH, TILE_W, TILE_DEPTH))
-        pygame.draw.rect(s, C_LOCKED_ICON, r, 1)
-        # Padlock icon centred on tile
-        cx = sx + TILE_W // 2;  cy = sy + TILE_H // 2
-        pygame.draw.rect(s, C_LOCKED_ICON, (cx-6, cy, 12, 9),  border_radius=2)
-        pygame.draw.rect(s, C_LOCKED_ICON, (cx-4, cy-7, 8, 8))
-        pygame.draw.rect(s, C_ISO_LOCK_T,  (cx-2, cy-6, 4, 7))
-        pygame.draw.rect(s, C_ISO_LOCK_T,  (cx-2, cy+2, 4, 4))
-        hint = self.font_small.render("[S]", True, C_LOCKED_ICON)
+        ck = ('__locked__', 0, 0)
+        if ck not in self._tile_surf_cache:
+            lsurf = pygame.Surface((TILE_W, TILE_H))
+            lsurf.fill((26, 16, 8))
+            h = 0xA3F713
+            for _ in range(7):
+                h  = (h * 1664525 + 1013904223) & 0x7FFFFFFF
+                ex = h % (TILE_W - 12) + 6
+                h  = (h * 1664525 + 1013904223) & 0x7FFFFFFF
+                ey = h % (TILE_H - 10) + 5
+                h  = (h * 1664525 + 1013904223) & 0x7FFFFFFF
+                ew = h % 16 + 8
+                pygame.draw.ellipse(lsurf, (18, 10, 4), (ex - ew//2, ey - 4, ew, 8))
+            pygame.draw.rect(lsurf, (18, 10, 4), (0, 0, TILE_W, 2))
+            for i in range(TILE_DEPTH):
+                t  = i / max(1, TILE_DEPTH - 1)
+                dc = _lerp_c((22, 12, 4), (12, 6, 2), t)
+                pygame.draw.rect(lsurf, dc, (0, TILE_H - TILE_DEPTH + i, TILE_W, 1))
+            self._tile_surf_cache[ck] = lsurf
+        s.blit(self._tile_surf_cache[ck], (sx, sy))
+
+        cx = sx + TILE_W // 2
+        cy = sy + TILE_H // 2
+
+        # Padlock body — layered for depth
+        for col, rect in [
+            ((44, 30, 16), (cx - 7, cy + 1, 14, 11)),
+            ((58, 42, 24), (cx - 6, cy + 2, 12, 9)),
+        ]:
+            pygame.draw.rect(s, col, rect, border_radius=2)
+        # Keyhole
+        pygame.draw.circle(s, (32, 20, 8), (cx, cy + 6), 3)
+        pygame.draw.circle(s, (22, 12, 4), (cx, cy + 6), 2)
+
+        # Shackle (U shape)
+        pygame.draw.rect(s, (50, 36, 20), (cx - 4, cy - 8, 8, 9))
+        pygame.draw.rect(s, (26, 16, 8),  (cx - 2, cy - 6, 4, 7))
+
+        hint = self.font_small.render("[S]", True, (56, 40, 22))
         s.blit(hint, (cx - hint.get_width() // 2, sy + TILE_H - hint.get_height() - 4))
 
     def draw_tile(self, sx: int, sy: int, tile, r: int, c: int):
-        """Draw a single tile at rect top-left (sx, sy)."""
-        s    = self.screen
-        seed = (r * 0x6B + c * 0xA3 + 0xFF) & 0xFF
-        dv   = (seed % 18) - 9
-
+        """Draw a tile using pre-baked surface + dynamic crop overlay."""
         if tile.state == TileState.OBSTACLE:
-            base = tuple(max(0, min(255, v + dv // 2)) for v in C_ISO_STONE_T)
-            pygame.draw.rect(s, base, (sx, sy, TILE_W, TILE_H))
-            # Slightly darker top edge (far side)
-            pygame.draw.rect(s, C_ISO_STONE_L, (sx, sy, TILE_W, 2))
-            # Depth strip at bottom
-            pygame.draw.rect(s, C_ISO_STONE_R, (sx, sy + TILE_H - TILE_DEPTH, TILE_W, TILE_DEPTH))
-            pygame.draw.rect(s, C_ISO_STONE_R, (sx, sy, TILE_W, TILE_H), 1)
-            # Cracks
-            h2 = r * 23 + c * 41 + 7
-            for i in range(3):
-                ox2 = ((h2*(i+1)*17) % (TILE_W - 10)) + 5
-                oy2 = ((h2*(i+1)*11) % (TILE_H - 10)) + 5
-                pygame.draw.line(s, C_ISO_STONE_R, (sx+ox2, sy+oy2), (sx+ox2+6, sy+oy2+4), 1)
+            sk = 'obs'
+        elif tile.state == TileState.PLANTED:
+            sk = 'wet'
         else:
-            if tile.state == TileState.PLANTED:
-                base = (max(0, C_ISO_SOIL_T[0]-12), max(0, C_ISO_SOIL_T[1]-6),
-                        min(255, C_ISO_SOIL_T[2]+5))
-            else:
-                base = C_ISO_SOIL_T
-            fc = tuple(max(0, min(255, v + dv // 2)) for v in base)
-            # Main surface
-            pygame.draw.rect(s, fc, (sx, sy, TILE_W, TILE_H))
-            # Far-edge shadow (top, 2px)
-            pygame.draw.rect(s, C_ISO_SOIL_L, (sx, sy, TILE_W, 2))
-            # Tilt depth strip (bottom)
-            pygame.draw.rect(s, C_ISO_SOIL_R, (sx, sy + TILE_H - TILE_DEPTH, TILE_W, TILE_DEPTH))
-            # Tile border
-            pygame.draw.rect(s, C_TILE_BDR, (sx, sy, TILE_W, TILE_H), 1)
-            # Soil texture dots
-            for ddx, ddy, col in self._get_tile_dots(r, c):
-                pygame.draw.rect(s, col, (sx + ddx, sy + ddy, 2, 1))
-            # Crop content
-            if tile.state == TileState.PLANTED:
-                self._draw_sprout(sx, sy, tile)
-                self._draw_pips(sx, sy, tile)
-            elif tile.state == TileState.READY:
-                self._draw_crop(sx, sy, tile)
+            sk = 'dry'
+        ck = (r, c, sk)
+        if ck not in self._tile_surf_cache:
+            self._tile_surf_cache[ck] = self._bake_tile(r, c, sk)
+        self.screen.blit(self._tile_surf_cache[ck], (sx, sy))
+
+        if tile.state == TileState.PLANTED:
+            self._draw_sprout(sx, sy, tile)
+            self._draw_pips(sx, sy, tile)
+        elif tile.state == TileState.READY:
+            self._draw_crop(sx, sy, tile)
 
     # ── top-down robot ────────────────────────────────────────────────────────
 
     def draw_robot(self, robot: Robot, anim_type: str, t_raw: float):
-        s  = self.screen
-        # Slight vertical bob while moving
+        s   = self.screen
         bob = int(-math.sin(t_raw * math.pi) * 3) if anim_type == 'move' else 0
         cx  = int(robot.px)
         cy  = int(robot.py) + bob
 
-        # Shadow (offset slightly south = toward camera)
-        pygame.draw.ellipse(s, C_ISO_SHADOW, (cx - 14, cy + 4, 28, 9))
+        # Soft ground shadow (pre-rendered SRCALPHA surface)
+        s.blit(self._robot_shadow, (cx - 20, cy + 4))
 
-        # Body oval (denim overalls, slightly squashed for top-down tilt)
-        pygame.draw.ellipse(s, C_OV_DARK, (cx - 9,  cy - 6,  18, 14))
-        pygame.draw.ellipse(s, C_OV_MAIN, (cx - 8,  cy - 7,  16, 12))
-        # Bib highlight
-        pygame.draw.ellipse(s, (102, 140, 195), (cx - 4, cy - 6, 8, 6))
+        # ── Body / overalls ───────────────────────────────────────────────────
+        # Base dark layer
+        pygame.draw.ellipse(s, (38, 58,  96), (cx - 10, cy - 6, 20, 16))
+        # Main denim blue
+        pygame.draw.ellipse(s, (60, 94, 148), (cx -  9, cy - 7, 18, 14))
+        # Shoulder highlight
+        pygame.draw.ellipse(s, (80, 118, 172), (cx - 6, cy - 8, 12, 8))
+        # Central bib stripe
+        pygame.draw.ellipse(s, (92, 132, 182), (cx - 3, cy - 7,  6, 6))
 
-        # Straw hat brim (large circle — dominant in top-down view)
-        pygame.draw.ellipse(s, (148, 114, 40), (cx - 16, cy - 22, 32, 20))  # brim shadow
-        pygame.draw.ellipse(s, C_HAT_BRIM,     (cx - 15, cy - 24, 30, 20))  # brim
-        # Hat dome (inner circle, slightly offset for tilt)
-        pygame.draw.ellipse(s, C_HAT_DOME,     (cx - 9,  cy - 26, 18, 14))
-        pygame.draw.ellipse(s, (220, 188, 96), (cx - 5,  cy - 25,  8,  7))  # dome highlight
-        # Hat band
-        pygame.draw.ellipse(s, C_HAT_BAND, (cx - 10, cy - 17, 20, 6))
+        # ── Straw hat ─────────────────────────────────────────────────────────
+        # Wide brim — 3 layered ellipses for soft edge
+        pygame.draw.ellipse(s, (132,  96, 26), (cx - 18, cy - 23, 36, 23))   # outermost shadow
+        pygame.draw.ellipse(s, (158, 120, 40), (cx - 17, cy - 25, 34, 22))   # mid brim
+        pygame.draw.ellipse(s, (178, 142, 54), (cx - 14, cy - 26, 28, 21))   # inner brim lit
 
-        # Face direction indicator: small coloured dot on the edge of the hat
+        # Dome — elevated above brim
+        pygame.draw.ellipse(s, (148, 112, 32), (cx - 10, cy - 31, 20, 17))   # dome shadow
+        pygame.draw.ellipse(s, (186, 152, 52), (cx -  9, cy - 32, 18, 16))   # dome main
+        pygame.draw.ellipse(s, (208, 176, 72), (cx -  5, cy - 33,  9,  9))   # dome highlight
+
+        # Hat band (dark reddish-brown stripe)
+        pygame.draw.ellipse(s, ( 82,  46, 18), (cx - 11, cy - 18, 22,  7))
+        pygame.draw.ellipse(s, ( 98,  58, 26), (cx - 10, cy - 19, 20,  6))
+
+        # ── Face direction dot on brim edge ───────────────────────────────────
         ar  = math.radians(robot.visual_angle)
-        fr  = 11.0
+        fr  = 12.0
         fdx = math.cos(ar) * fr
-        fdy = math.sin(ar) * fr * 0.6   # squash y slightly for tilt perspective
+        fdy = math.sin(ar) * fr * 0.55    # squash y for tilt perspective
         fx  = int(cx + fdx)
-        fy  = int(cy - 20 + fdy)        # anchored to hat centre height
-        pygame.draw.circle(s, C_BOT_FACE, (fx, fy), 4)
-        pygame.draw.circle(s, C_BOT_EYE,  (fx, fy), 2)
+        fy  = int(cy - 22 + fdy)
+        # Warm skin-tone face peek
+        pygame.draw.circle(s, (200, 155, 100), (fx, fy), 4)
+        pygame.draw.circle(s, (178, 130,  78), (fx, fy), 2)
+        pygame.draw.circle(s, ( 60,  36,  14), (fx, fy), 1)
 
     # ── top-down environment ──────────────────────────────────────────────────
 
     def _draw_left_bg(self, grid: Grid, tod: float = 0.25):
         s = self.screen
-        # Background gradient (serves as ambient light colour, tied to time of day)
+
+        # ── Sky gradient (lazily regenerated per 0.4% tod step) ───────────────
         sky_top, sky_bot = _sky_colors(tod)
         if abs(tod - self._sky_tod) > 0.004:
             self._sky_tod = tod
             for _y in range(WIN_H):
-                _t = min(1.0, _y / (WIN_H * 0.72))
-                _c = _lerp_c(sky_top, sky_bot, _t)
+                _t  = min(1.0, _y / (WIN_H * 0.72))
+                _c  = _lerp_c(sky_top, sky_bot, _t)
                 self._sky_surf.fill(_c, (0, _y, PANEL_W, 1))
         s.blit(self._sky_surf, (0, 0))
 
-        # Grass ground — fills area below (and around) the tile grid
+        # Faint horizon glow strip (warm lighter band near horizon)
+        hz_y   = int(WIN_H * 0.30)
+        hz_col = _lerp_c(sky_bot, (235, 225, 205), 0.28)
+        for dy in range(-3, 4):
+            alpha = max(0, 55 - abs(dy) * 14)
+            hsurf = pygame.Surface((PANEL_W, 1), pygame.SRCALPHA)
+            hsurf.fill((*hz_col, alpha))
+            s.blit(hsurf, (0, hz_y + dy))
+
         vrec     = grid.visual_rect()
         ground_y = vrec.bottom - 4
-        pygame.draw.rect(s, C_GRASS,    (0, ground_y, PANEL_W, WIN_H - ground_y))
-        pygame.draw.rect(s, C_GRASS_DK, (0, ground_y, PANEL_W, 3))
-        for i in range(0, PANEL_W, 12):
-            pygame.draw.rect(s, C_GRASS_LT, (i,     ground_y - 3, 4, 5))
-            pygame.draw.rect(s, C_GRASS,    (i + 6, ground_y - 5, 3, 4))
 
-        # Subtle drop-shadow under the whole grid block
-        shadow_rect = pygame.Rect(vrec.x + 5, vrec.y + 5, vrec.w, vrec.h)
-        shadow_surf = pygame.Surface((shadow_rect.w, shadow_rect.h), pygame.SRCALPHA)
-        shadow_surf.fill((0, 0, 0, 40))
-        s.blit(shadow_surf, (shadow_rect.x, shadow_rect.y))
+        # ── Grass ground — multiple layered tones ─────────────────────────────
+        pygame.draw.rect(s, (46, 74, 28),  (0, ground_y + 6, PANEL_W, WIN_H))
+        pygame.draw.rect(s, (52, 84, 34),  (0, ground_y,     PANEL_W, WIN_H))
+
+        # Organic grass edge: seeded ellipses, random heights and green tones
+        gh = 0xDEAD1337
+        for i in range(0, PANEL_W + 18, 9):
+            gh = (gh * 1664525 + 1013904223) & 0x7FFFFFFF
+            jitter = (gh % 8) - 4
+            hvar   = (gh % 10) + 4
+            gh = (gh * 1664525 + 1013904223) & 0x7FFFFFFF
+            gr  = 52 + gh % 18
+            gg  = 90 + gh % 22
+            gb  = 28 + gh % 14
+            pygame.draw.ellipse(s, (gr, gg, gb),
+                                (i - 7, ground_y - hvar//2 + jitter, 16, hvar + 6))
+
+        # ── Farm platform: raised earth side face below grid ──────────────────
+        plat_y = vrec.bottom - 2
+        plat_h = 10
+        for i in range(plat_h):
+            t   = i / plat_h
+            col = _lerp_c((72, 48, 26), (36, 20, 8), t)
+            pygame.draw.rect(s, col, (vrec.x - 4, plat_y + i, vrec.w + 8, 1))
+        # Grass fringe along top of platform
+        for i in range(vrec.x - 2, vrec.x + vrec.w + 4, 7):
+            pygame.draw.ellipse(s, (60, 96, 36), (i - 4, plat_y - 4, 9, 6))
+
+        # ── Ambient-occlusion shadow under the grid block ─────────────────────
+        ao_w   = vrec.w + 16
+        ao_h   = 12
+        ao_s   = pygame.Surface((ao_w, ao_h), pygame.SRCALPHA)
+        for i in range(6):
+            alpha = int((1.0 - i / 6) * 48)
+            pygame.draw.rect(ao_s, (0, 0, 0, alpha),
+                             (i, i, ao_w - i * 2, ao_h - i * 2))
+        s.blit(ao_s, (vrec.x - 8, vrec.y - 6))
 
     def _draw_time_indicator(self, s, tod: float, day: int):
         """Small arc + sun/moon dial showing current time of day."""
@@ -1017,22 +1379,64 @@ class Renderer:
 
     def _draw_wood_panel(self):
         s = self.screen
-        pygame.draw.rect(s, C_WOOD_BG, (PANEL_W, 0, PANEL_W, WIN_H))
-        for y in range(0, WIN_H, 58):
-            pygame.draw.line(s, C_WOOD_GRAIN, (PANEL_W, y),     (WIN_W, y),     1)
-            pygame.draw.line(s, C_WOOD_LT,    (PANEL_W, y + 1), (WIN_W, y + 1), 1)
-        pygame.draw.rect(s, C_DIVIDER, (PANEL_W, 0, 4, WIN_H))
+        # 4-layer walnut base — subtle gradient from left to right
+        for i, col in enumerate([(32, 18, 8), (36, 22, 10), (40, 26, 12), (42, 28, 14)]):
+            pygame.draw.rect(s, col, (PANEL_W + i * (PANEL_W//4), 0, PANEL_W//4 + 2, WIN_H))
+
+        # Diagonal grain lines (slightly off-45°, alternating dark and warm-light)
+        grain_stride = 44
+        for base_y in range(-WIN_H, WIN_H * 2, grain_stride):
+            # Dark grain
+            pygame.draw.aaline(s, (24, 12, 4),
+                               (PANEL_W, base_y), (WIN_W, base_y + WIN_W // 3))
+            # Light grain (slightly offset)
+            pygame.draw.aaline(s, (52, 36, 18),
+                               (PANEL_W, base_y + grain_stride // 2),
+                               (WIN_W, base_y + grain_stride // 2 + WIN_W // 3))
+
+        # Horizontal plank seams every ~56px
+        for y in range(0, WIN_H, 56):
+            pygame.draw.aaline(s, (22, 10, 2), (PANEL_W, y),     (WIN_W, y))
+            pygame.draw.aaline(s, (54, 38, 20),(PANEL_W, y + 1), (WIN_W, y + 1))
+
+        # Left divider strip — 3 layers for chiselled edge
+        pygame.draw.rect(s, (46, 30, 14), (PANEL_W,     0, 4, WIN_H))
+        pygame.draw.rect(s, (62, 46, 26), (PANEL_W + 1, 0, 2, WIN_H))
+        pygame.draw.rect(s, (70, 54, 32), (PANEL_W + 1, 0, 1, WIN_H))
 
     def _draw_run_button(self, btn: pygame.Rect, is_running: bool, hover: bool):
         s = self.screen
         if is_running:
-            bg, txt_c, label = C_BTN_DIS, C_BTN_DIS_TXT, "Running..."
+            bg0, bg1 = (50, 30, 12), (60, 38, 16)
+            txt_c    = (92, 70, 46)
+            label    = "Running..."
+        elif hover:
+            bg0, bg1 = (118, 78, 36), (142, 98, 50)
+            txt_c    = (252, 230, 178)
+            label    = "Run  >"
         else:
-            bg, txt_c, label = (C_BTN_LT if hover else C_BTN_WOOD), C_BTN_TXT, "Run  >"
-        pygame.draw.rect(s, C_BTN_DK, pygame.Rect(btn.x+3,btn.y+3,btn.w,btn.h), border_radius=5)
-        pygame.draw.rect(s, bg, btn, border_radius=5)
-        pygame.draw.line(s, C_BTN_LT, (btn.x+4, btn.y+2), (btn.right-4, btn.y+2), 1)
-        pygame.draw.rect(s, C_BTN_DK, btn, 2, border_radius=5)
+            bg0, bg1 = (86, 52, 22), (106, 68, 30)
+            txt_c    = (244, 222, 170)
+            label    = "Run  >"
+
+        # Drop shadow (inset look)
+        pygame.draw.rect(s, (20, 10, 2),
+                         pygame.Rect(btn.x + 3, btn.y + 3, btn.w, btn.h), border_radius=5)
+
+        # Button face — two-tone top-to-bottom gradient (2 halves)
+        h2 = btn.h // 2
+        pygame.draw.rect(s, bg0, btn, border_radius=5)
+        pygame.draw.rect(s, bg1, pygame.Rect(btn.x, btn.y, btn.w, h2), border_radius=5)
+
+        # Top highlight edge (carved wood lit-top)
+        pygame.draw.aaline(s, (148, 108, 58), (btn.x + 6, btn.y + 2), (btn.right - 6, btn.y + 2))
+
+        # Bottom shadow edge
+        pygame.draw.aaline(s, (20, 8, 2), (btn.x + 6, btn.bottom - 3), (btn.right - 6, btn.bottom - 3))
+
+        # Border
+        pygame.draw.rect(s, (52, 28, 8), btn, 2, border_radius=5)
+
         bl = self.font_ui.render(label, True, txt_c)
         s.blit(bl, (btn.x + (btn.w - bl.get_width())  // 2,
                     btn.y + (btn.h - bl.get_height()) // 2))
@@ -1175,52 +1579,72 @@ class Renderer:
             s.blit(usage, (row.right - usage.get_width() - 12, row.y + 22))
 
     def _draw_shop_cmds_tab(self, s, cy, ch, state: GameState, mouse_pos):
-        x0 = SHOP_X + 8
-        CMDS = [
-            ('repeat',        'repeat(n, [cmd, …])',
-             'Repeats a list of commands n times.',
-             'repeat(3, [move, harvest])'),
-            ('if_crop_ready', 'if_crop_ready()',
-             'Returns True if the current tile has a crop ready to harvest.',
-             'if if_crop_ready(): harvest()'),
-            ('face',          'face(direction)',
-             'Instantly faces the robot in a cardinal direction.',
-             'face("north")'),
-        ]
-        row_h   = 96
-        row_gap = 6
-        for i, (key, sig, desc, example) in enumerate(CMDS):
-            owned   = key in state.unlocked_cmds
-            row     = pygame.Rect(x0, cy + 4 + i * (row_h + row_gap), SHOP_W - 16, row_h)
-            bg_col  = C_SHOP_ROW_A if i % 2 == 0 else C_SHOP_ROW_B
-            pygame.draw.rect(s, bg_col,   row, border_radius=4)
-            pygame.draw.rect(s, C_WOOD_LT, row, 1, border_radius=4)
+        x0      = SHOP_X + 8
+        row_w   = SHOP_W - 28   # leave 12px for scrollbar on right
+        scroll  = state.shop_cmd_scroll
 
-            txt_col  = C_WARM_WHT if owned else C_SHOP_LOCK_TXT
-            desc_col = C_WARM_GRY if owned else (80, 65, 50)
+        # Clip to content area
+        clip = pygame.Rect(x0, cy, row_w, ch)
+        s.set_clip(clip)
 
-            # Signature
-            s.blit(self.font_ui.render(sig, True, txt_col),
-                   (row.x + 12, row.y + 8))
+        y       = cy - scroll + 4
+        parity  = 0
 
-            # One-line description
-            s.blit(self.font_label.render(desc, True, desc_col),
-                   (row.x + 12, row.y + 30))
+        for title, items in SHOP_CMDS:
+            # Section header
+            if cy <= y + _SHOP_CMD_SEC_H and y < cy + ch:
+                pygame.draw.rect(s, (40, 26, 14),
+                                 (x0, y, row_w, _SHOP_CMD_SEC_H), border_radius=3)
+                hdr_s = self.font_label.render(title.upper(), True, C_WARM_GRY)
+                s.blit(hdr_s, (x0 + 8, y + 4))
+            y += _SHOP_CMD_SEC_H + _SHOP_CMD_SEC_GAP
 
-            # Example box (dark warm rect + monospace yellow text)
-            ex_surf = self.font_mono.render(example, True, C_CON_YLW)
-            ex_rect = pygame.Rect(row.x + 12, row.y + 50,
-                                  ex_surf.get_width() + 10, ex_surf.get_height() + 4)
-            pygame.draw.rect(s, (28, 18, 8),   ex_rect, border_radius=3)
-            pygame.draw.rect(s, C_DIVIDER,      ex_rect, 1, border_radius=3)
-            s.blit(ex_surf, (ex_rect.x + 5, ex_rect.y + 2))
+            for key, sig, desc, example in items:
+                row_top = y
+                row_bot = y + _SHOP_CMD_ROW_H
+                if row_bot >= cy and row_top < cy + ch:
+                    owned    = key in state.unlocked_cmds
+                    cost     = CMD_PRICES.get(key, 10)
+                    row      = pygame.Rect(x0, y, row_w, _SHOP_CMD_ROW_H)
+                    bg_col   = C_SHOP_ROW_A if parity % 2 == 0 else C_SHOP_ROW_B
+                    pygame.draw.rect(s, bg_col,    row, border_radius=4)
+                    pygame.draw.rect(s, C_WOOD_LT, row, 1, border_radius=4)
 
-            # Cost + buy button
-            cost_col = C_GOLD if not owned else C_WARM_GRY
-            s.blit(self.font_label.render("10 pts", True, cost_col),
-                   (row.x + 12, row.y + row_h - 18))
-            self._shop_buy_btn(s, row.right - 80, row.y + (row_h - 34) // 2, 68, 34,
-                               key, state.points >= 10, owned, mouse_pos)
+                    txt_col  = C_WARM_WHT if owned else C_SHOP_LOCK_TXT
+                    desc_col = C_WARM_GRY if owned else (80, 65, 50)
+
+                    s.blit(self.font_ui.render(sig, True, txt_col),
+                           (row.x + 12, row.y + 7))
+                    s.blit(self.font_label.render(desc, True, desc_col),
+                           (row.x + 12, row.y + 27))
+
+                    ex_line = example.split('\n')[0]
+                    ex_surf = self.font_mono.render(ex_line, True, C_CON_WHT)
+                    ex_rect = pygame.Rect(row.x + 12, row.y + 47,
+                                         ex_surf.get_width() + 10, ex_surf.get_height() + 4)
+                    pygame.draw.rect(s, (28, 18, 8), ex_rect, border_radius=3)
+                    pygame.draw.rect(s, C_DIVIDER,   ex_rect, 1, border_radius=3)
+                    s.blit(ex_surf, (ex_rect.x + 5, ex_rect.y + 2))
+
+                    cost_col = C_GOLD if not owned else C_WARM_GRY
+                    s.blit(self.font_label.render(f"{cost} pts", True, cost_col),
+                           (row.x + 12, row.y + _SHOP_CMD_ROW_H - 18))
+
+                    self._shop_buy_btn(s, row.right - 78, row.y + 12, 66, 30,
+                                       key, state.points >= cost, owned, mouse_pos)
+
+                y    += _SHOP_CMD_ROW_H + _SHOP_CMD_ROW_GAP
+                parity += 1
+
+        s.set_clip(None)
+
+        # Scrollbar
+        if _SHOP_CMD_MAX_SCROLL > 0:
+            sb_x    = SHOP_X + SHOP_W - 14
+            thumb_h = max(20, int(ch * ch / (ch + _SHOP_CMD_MAX_SCROLL)))
+            thumb_y = cy + int(scroll / _SHOP_CMD_MAX_SCROLL * (ch - thumb_h))
+            pygame.draw.rect(s, (40, 28, 16), (sb_x, cy, 8, ch), border_radius=4)
+            pygame.draw.rect(s, C_WARM_GRY,   (sb_x, thumb_y, 8, thumb_h), border_radius=4)
 
     # ── main draw call ────────────────────────────────────────────────────────
 
@@ -1485,6 +1909,12 @@ def main():
                         editor.focused = True
                     else:
                         editor.focused = False
+
+            elif event.type == pygame.MOUSEWHEEL:
+                if state.shop_open and state.shop_tab == 2:
+                    state.shop_cmd_scroll = max(
+                        0, min(_SHOP_CMD_MAX_SCROLL,
+                               state.shop_cmd_scroll - event.y * 20))
 
         # ── animation update (paused when shop is open) ──────────────────────
         robot = state.robot
