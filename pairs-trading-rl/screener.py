@@ -16,9 +16,9 @@ PVALUE_THRESHOLD = 0.05
 def download_prices(tickers: list[str], period: str = "3y",
                     start: str | None = None, end: str | None = None) -> pd.DataFrame:
     if start or end:
-        raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False, threads=True)
+        raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
     else:
-        raw = yf.download(tickers, period=period, auto_adjust=True, progress=False, threads=True)
+        raw = yf.download(tickers, period=period, auto_adjust=True, progress=False)
     prices = raw["Close"].dropna()
     print(f"Downloaded {len(prices)} trading days  ({prices.index[0].date()} → {prices.index[-1].date()})")
     print(f"Tickers: {list(prices.columns)}\n")
@@ -47,7 +47,8 @@ def test_pair(t1: str, t2: str, s1: pd.Series, s2: pd.Series) -> dict | None:
 
     spread = s1 - beta * s2
     half_life = calc_half_life(spread)
-    zscore = (spread.iloc[-1] - spread.mean()) / spread.std()
+    std = spread.std()
+    zscore = float((spread.iloc[-1] - spread.mean()) / std) if std > 0 else 0.0
 
     return {
         "pair":           f"{t1}/{t2}",

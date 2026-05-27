@@ -100,6 +100,7 @@ def run_oos(model, env: PairsTradingEnv) -> tuple[list, list]:
     trades     = []
     open_trade = None
 
+    step = -1
     for step in range(n_steps):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, _, info = env.step(int(action))

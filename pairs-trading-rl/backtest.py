@@ -30,6 +30,7 @@ def run_backtest():
     # Track open trade
     open_trade = None  # {"entry_date", "direction", "entry_spread"}
 
+    step = -1
     for step in range(n_steps):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, _, info = env.step(int(action))
@@ -80,7 +81,7 @@ def run_backtest():
             "pnl":        round(pnl, 4),
         })
 
-    return equity, daily_pnl, trades, env.dates[COINT_WINDOW: COINT_WINDOW + len(equity)]
+    return equity, daily_pnl, trades, env.dates[COINT_WINDOW: COINT_WINDOW + len(equity) - 1]
 
 
 def compute_stats(trades, daily_pnl):

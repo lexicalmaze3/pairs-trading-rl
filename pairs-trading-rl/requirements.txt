@@ -4,3 +4,5 @@ numpy
 statsmodels
 scipy
 gymnasium
+stable_baselines3
+matplotlib
