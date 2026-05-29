@@ -32,6 +32,7 @@ OOS_DAYS      = 60
 STEP_DAYS     = 60
 TIMESTEPS     = 100_000
 PVALUE_THRESH = 0.05
+SEED          = 42
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -96,17 +97,28 @@ def run_oos(model, env: PairsTradingEnv) -> tuple[list, list]:
     env._episode_length = n_steps
     obs, _ = env.reset(options={"episode_start": COINT_WINDOW})
 
-    daily_pnl  = []
-    trades     = []
-    open_trade = None
+    daily_pnl     = []
+    trades        = []
+    open_trade    = None
+    prev_spread   = None
+    prev_position = 0
 
     step = -1
     for step in range(n_steps):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, _, info = env.step(int(action))
-        daily_pnl.append(reward)
+        obs, _, terminated, _, info = env.step(int(action))
 
-        date = env.dates[min(COINT_WINDOW + step, env._n - 1)]
+        # Mark-to-market PnL of the position carried into this day, in spread
+        # units. Reconstructed from spread moves rather than the RL `reward`
+        # so the Sharpe reflects realized trading PnL and is not contaminated
+        # by reward shaping (holding penalty, mean-reversion exit bonus).
+        spread = info["spread"]
+        if prev_spread is not None:
+            daily_pnl.append(prev_position * (spread - prev_spread))
+        prev_spread   = spread
+        prev_position = env.position
+
+        date = env.dates[COINT_WINDOW + step]
 
         if open_trade is None and env.position != 0:
             open_trade = {
@@ -125,7 +137,7 @@ def run_oos(model, env: PairsTradingEnv) -> tuple[list, list]:
             break
 
     if open_trade is not None:
-        last_idx = min(COINT_WINDOW + step, env._n - 1)
+        last_idx = COINT_WINDOW + step
         sign     = 1 if open_trade["direction"] == "long" else -1
         pnl      = (env._spread[last_idx] - open_trade["entry_spread"]) * sign
         trades.append({
@@ -152,7 +164,9 @@ def main():
     all_dates  = all_prices.index
     total      = len(all_dates)
 
-    fold_starts = list(range(0, total - TRAIN_DAYS - OOS_DAYS, STEP_DAYS))
+    # +1 so the final fold, whose OOS window ends on the last available day,
+    # is included — range's upper bound is exclusive.
+    fold_starts = list(range(0, total - TRAIN_DAYS - OOS_DAYS + 1, STEP_DAYS))
     print(f"Running {len(fold_starts)} folds  "
           f"(train={TRAIN_DAYS}d, oos={OOS_DAYS}d, step={STEP_DAYS}d)\n")
 
@@ -196,7 +210,7 @@ def main():
         train_env = make_env(all_prices, t1, t2, hedge,
                              start_i, end_train_i,
                              episode_length=TRAIN_DAYS - COINT_WINDOW)
-        model = PPO("MlpPolicy", train_env,
+        model = PPO("MlpPolicy", train_env, seed=SEED,
                     n_steps=2048, batch_size=64, ent_coef=0.02, verbose=0)
         model.learn(total_timesteps=TIMESTEPS)
         print(f"         trained {TIMESTEPS:,} steps")
