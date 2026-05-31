@@ -37,7 +37,10 @@ def calc_half_life(spread: pd.Series) -> float:
 
 
 def test_pair(t1: str, t2: str, s1: pd.Series, s2: pd.Series) -> dict | None:
-    _, pvalue, _ = coint(s1, s2)
+    try:
+        _, pvalue, _ = coint(s1, s2)
+    except Exception:
+        return None
     if pvalue >= PVALUE_THRESHOLD:
         return None
 

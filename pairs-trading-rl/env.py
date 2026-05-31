@@ -1,6 +1,5 @@
 import warnings
 import numpy as np
-import pandas as pd
 import yfinance as yf
 import gymnasium as gym
 from gymnasium import spaces
@@ -15,13 +14,18 @@ COINT_INTERVAL   = 20           # recalculate every N steps
 HOLDING_COST     = 0.005        # per step while position is open
 WEAK_COINT_PEN   = 0.01         # penalty when rolling p-value > threshold
 WEAK_COINT_THRESH = 0.1
+HOLD_NORM        = 252          # fixed normalizer for the steps-since-entry obs.
+                                # MUST stay constant across train/eval — episode
+                                # length varies by phase, so dividing by it would
+                                # feed the policy a differently-scaled feature at
+                                # test time than it saw in training.
 
 
 class PairsTradingEnv(gym.Env):
     """
-    Pairs trading environment for GLD/RTX.
+    Pairs trading environment for a cointegrated pair (ticker1, ticker2).
 
-    Spread = GLD - HEDGE_RATIO * RTX
+    Spread = ticker1 - hedge_ratio * ticker2
 
     Actions:
         0 = go flat  (close any open position)
@@ -29,7 +33,7 @@ class PairsTradingEnv(gym.Env):
         2 = short spread
 
     Observation (4 floats):
-        [z-score, position (-1/0/1), steps_since_entry/episode_length, coint_p_value]
+        [z-score, position (-1/0/1), min(steps_since_entry / HOLD_NORM, 1), coint_p_value]
     """
 
     metadata = {"render_modes": []}
@@ -127,10 +131,11 @@ class PairsTradingEnv(gym.Env):
     def _obs(self) -> np.ndarray:
         idx    = min(self.episode_start + self.current_step, self._n - 1)
         zscore = np.clip(self._zscore_at(idx), -5.0, 5.0)
+        held   = float(np.clip(self.steps_since_entry / HOLD_NORM, 0.0, 1.0))
         return np.array(
             [zscore,
              float(self.position),
-             self.steps_since_entry / self._episode_length,
+             held,
              self._coint_pvalue],
             dtype=np.float32,
         )

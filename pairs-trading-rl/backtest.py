@@ -23,47 +23,50 @@ def run_backtest():
 
     obs, _ = env.reset(options={"episode_start": COINT_WINDOW})
 
-    equity       = [0.0]
-    daily_pnl    = []
-    trades       = []
-
-    # Track open trade
-    open_trade = None  # {"entry_date", "direction", "entry_spread"}
+    daily_pnl     = []
+    trades        = []
+    open_trade    = None   # {"entry_date", "direction", "entry_spread"}
+    prev_spread   = None
+    prev_position = 0
 
     step = -1
     for step in range(n_steps):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, _, info = env.step(int(action))
+        obs, _, terminated, _, info = env.step(int(action))
 
-        daily_pnl.append(reward)
-        equity.append(equity[-1] + reward)
+        # Mark-to-market PnL of the position carried into this day, in spread
+        # units — reconstructed from spread moves, NOT the RL `reward`, so the
+        # equity curve and Sharpe reflect realized trading PnL and aren't
+        # contaminated by reward shaping (holding cost, exit bonus, coint
+        # penalty). Mirrors walk_forward.run_oos.
+        spread = info["spread"]
+        if prev_spread is not None:
+            daily_pnl.append(prev_position * (spread - prev_spread))
+        prev_spread   = spread
+        prev_position = env.position
 
-        data_idx = COINT_WINDOW + step
-        date     = env.dates[data_idx]
-        pos      = info["position"]
+        date = env.dates[COINT_WINDOW + step]
 
-        # Detect open
-        if open_trade is None and env.position != 0:
-            open_trade = {
-                "entry_date": date,
-                "direction":  "long" if env.position == 1 else "short",
-                "entry_spread": env.entry_spread,
-            }
-
-        # Detect close: position just went to 0 while we had an open trade
-        if open_trade is not None and env.position == 0:
-            # Realized P&L is embedded in reward when a close happened;
-            # recompute cleanly from spread delta
-            exit_spread = info["spread"]
-            sign = 1 if open_trade["direction"] == "long" else -1
-            pnl  = (exit_spread - open_trade["entry_spread"]) * sign
-            trades.append({
-                "entry_date":  open_trade["entry_date"],
-                "exit_date":   date,
-                "direction":   open_trade["direction"],
-                "pnl":         round(pnl, 4),
-            })
-            open_trade = None
+        # Log on any position change — comparing against the open trade's
+        # direction also catches direct long↔short flips.
+        cur_dir = 0 if open_trade is None else (1 if open_trade["direction"] == "long" else -1)
+        if env.position != cur_dir:
+            if open_trade is not None:
+                sign = 1 if open_trade["direction"] == "long" else -1
+                pnl  = (spread - open_trade["entry_spread"]) * sign
+                trades.append({
+                    "entry_date": open_trade["entry_date"],
+                    "exit_date":  date,
+                    "direction":  open_trade["direction"],
+                    "pnl":        round(pnl, 4),
+                })
+                open_trade = None
+            if env.position != 0:
+                open_trade = {
+                    "entry_date":   date,
+                    "direction":    "long" if env.position == 1 else "short",
+                    "entry_spread": env.entry_spread,
+                }
 
         if terminated:
             break
@@ -81,7 +84,10 @@ def run_backtest():
             "pnl":        round(pnl, 4),
         })
 
-    return equity, daily_pnl, trades, env.dates[COINT_WINDOW: COINT_WINDOW + len(equity) - 1]
+    # equity[i] = cumulative realized PnL at dates[i]; leading 0.0 = flat start.
+    equity = np.cumsum([0.0] + daily_pnl)
+    dates  = env.dates[COINT_WINDOW: COINT_WINDOW + len(equity)]
+    return equity, daily_pnl, trades, dates
 
 
 def compute_stats(trades, daily_pnl):
@@ -90,7 +96,9 @@ def compute_stats(trades, daily_pnl):
     total_trades = len(df)
     win_rate     = (df["pnl"] > 0).mean() if total_trades else 0.0
 
-    arr = np.array(daily_pnl)
+    arr = np.array(daily_pnl, dtype=float)
+    if arr.size == 0:
+        return total_trades, win_rate, 0.0, 0.0
     sharpe = (arr.mean() / arr.std() * np.sqrt(252)) if arr.std() > 0 else 0.0
 
     # Max drawdown from equity curve
@@ -129,8 +137,8 @@ def main():
     trades_df = pd.DataFrame(trades)
     trades_df.to_csv(TRADES_CSV, index=False)
 
-    # Plot
-    plot_equity(equity[1:], dates)
+    # Plot (equity and dates are already aligned, leading 0.0 = flat start)
+    plot_equity(equity, dates)
     print(f"Equity curve saved → {EQUITY_PNG}")
 
     # Stats

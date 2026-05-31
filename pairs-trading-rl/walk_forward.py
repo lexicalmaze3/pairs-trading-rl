@@ -40,7 +40,10 @@ SEED          = 42
 def download_all() -> pd.DataFrame:
     raw = yf.download(WATCHLIST, start=START_DATE, end=END_DATE,
                       auto_adjust=True, progress=False)
-    prices = raw["Close"].dropna(how="all")
+    # how="any": the env consumes raw numpy slices and cannot tolerate NaNs
+    # (a single missing leg poisons the spread, z-score and coint). Dropping
+    # rows where *any* ticker is missing keeps every retained day fully aligned.
+    prices = raw["Close"].dropna(how="any")
     print(f"Master data: {len(prices)} days  "
           f"({prices.index[0].date()} → {prices.index[-1].date()})")
     print(f"Tickers loaded: {list(prices.columns)}\n")
@@ -120,18 +123,22 @@ def run_oos(model, env: PairsTradingEnv) -> tuple[list, list]:
 
         date = env.dates[COINT_WINDOW + step]
 
-        if open_trade is None and env.position != 0:
-            open_trade = {
-                "entry_date":   date,
-                "direction":    "long" if env.position == 1 else "short",
-                "entry_spread": env.entry_spread,
-            }
-
-        if open_trade is not None and env.position == 0:
-            sign = 1 if open_trade["direction"] == "long" else -1
-            pnl  = (info["spread"] - open_trade["entry_spread"]) * sign
-            trades.append({**open_trade, "exit_date": date, "pnl": round(pnl, 4)})
-            open_trade = None
+        # Log on any position change. Comparing against the *open trade's*
+        # direction (not just position==0) catches direct long↔short flips,
+        # which close one trade and open another in a single step.
+        cur_dir = 0 if open_trade is None else (1 if open_trade["direction"] == "long" else -1)
+        if env.position != cur_dir:
+            if open_trade is not None:
+                sign = 1 if open_trade["direction"] == "long" else -1
+                pnl  = (spread - open_trade["entry_spread"]) * sign
+                trades.append({**open_trade, "exit_date": date, "pnl": round(pnl, 4)})
+                open_trade = None
+            if env.position != 0:
+                open_trade = {
+                    "entry_date":   date,
+                    "direction":    "long" if env.position == 1 else "short",
+                    "entry_spread": env.entry_spread,
+                }
 
         if terminated:
             break

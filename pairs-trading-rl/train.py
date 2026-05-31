@@ -54,12 +54,15 @@ def main():
 
     mean_r = np.mean(episode_rewards)
     std_r  = np.std(episode_rewards)
-    sharpe = mean_r / std_r if std_r > 0 else 0.0
+    # Ratio of mean to std of *episode rewards* — a consistency measure, not a
+    # Sharpe (and in-sample, since eval reuses the training window). Use
+    # backtest.py / walk_forward.py for an out-of-sample, PnL-based Sharpe.
+    ratio  = mean_r / std_r if std_r > 0 else 0.0
 
-    print(f"\nEval over 10 episodes:")
-    print(f"  Mean reward : {mean_r:.4f}")
-    print(f"  Std  reward : {std_r:.4f}")
-    print(f"  Est. Sharpe : {sharpe:.4f}")
+    print(f"\nEval over 10 episodes (in-sample):")
+    print(f"  Mean reward      : {mean_r:.4f}")
+    print(f"  Std  reward      : {std_r:.4f}")
+    print(f"  Reward mean/std  : {ratio:.4f}")
 
 
 if __name__ == "__main__":
