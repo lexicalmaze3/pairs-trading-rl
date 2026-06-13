@@ -1,5 +1,6 @@
 import argparse
 import itertools
+import sys
 import warnings
 import numpy as np
 import pandas as pd
@@ -9,7 +10,16 @@ from statsmodels.tsa.stattools import coint
 
 warnings.filterwarnings("ignore")
 
-WATCHLIST = ["SPY", "QQQ", "GLD", "SLV", "XOM", "CVX", "RTX", "LMT", "NOC", "AAPL", "MSFT", "AMZN"]
+# Print UTF-8 so decorative characters don't crash on Windows when redirected.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
+WATCHLIST = [
+    "SPY", "QQQ", "GLD", "SLV", "XOM", "CVX", "RTX", "LMT", "NOC",
+    "AAPL", "MSFT", "AMZN", "XLE", "XLK", "XLF", "GDX",
+]
 PVALUE_THRESHOLD = 0.05
 
 
@@ -20,6 +30,8 @@ def download_prices(tickers: list[str], period: str = "3y",
     else:
         raw = yf.download(tickers, period=period, auto_adjust=True, progress=False)
     prices = raw["Close"].dropna()
+    if prices.empty:
+        raise SystemExit("No price data downloaded — check tickers, dates, and network/yfinance.")
     print(f"Downloaded {len(prices)} trading days  ({prices.index[0].date()} → {prices.index[-1].date()})")
     print(f"Tickers: {list(prices.columns)}\n")
     return prices

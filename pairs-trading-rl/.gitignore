@@ -3,4 +3,7 @@ __pycache__/
 *.pyo
 *.png
 *.csv
-models/
+
+# Generated models are ignored, except the bundled demo model.
+models/*
+!models/pairs_ppo_GLD_RTX.zip

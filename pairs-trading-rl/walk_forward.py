@@ -10,6 +10,7 @@ Timeline per fold:
 """
 
 import itertools
+import sys
 import warnings
 import numpy as np
 import pandas as pd
@@ -18,8 +19,15 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 from stable_baselines3 import PPO
 from env import PairsTradingEnv, COINT_WINDOW
+from evaluate import run_episode
 
 warnings.filterwarnings("ignore")
+
+# Print UTF-8 so the box-drawing summary doesn't crash on Windows when redirected.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
 WATCHLIST = [
     "SPY", "QQQ", "GLD", "SLV", "XOM", "CVX", "RTX", "LMT", "NOC",
@@ -32,6 +40,11 @@ OOS_DAYS      = 60
 STEP_DAYS     = 60
 TIMESTEPS     = 100_000
 PVALUE_THRESH = 0.05
+# Training episode length. Must be short enough that the start can be randomized
+# inside the training window (start range is [COINT_WINDOW, TRAIN_DAYS - this]);
+# otherwise every episode is the identical trajectory and the agent overfits it.
+TRAIN_EPISODE_LEN = 126
+SEED          = 42
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -39,7 +52,11 @@ PVALUE_THRESH = 0.05
 def download_all() -> pd.DataFrame:
     raw = yf.download(WATCHLIST, start=START_DATE, end=END_DATE,
                       auto_adjust=True, progress=False)
-    prices = raw["Close"].dropna(how="all")
+    # Drop any row with a missing price so every fold slice is gap-free and the
+    # env never receives NaN. Tickers without full history shorten the window.
+    prices = raw["Close"].dropna()
+    if prices.empty:
+        raise SystemExit("No price data downloaded — check tickers, dates, and network/yfinance.")
     print(f"Master data: {len(prices)} days  "
           f"({prices.index[0].date()} → {prices.index[-1].date()})")
     print(f"Tickers loaded: {list(prices.columns)}\n")
@@ -92,48 +109,9 @@ def make_env(all_prices: pd.DataFrame,
 # ── OOS evaluation ────────────────────────────────────────────────────────────
 
 def run_oos(model, env: PairsTradingEnv) -> tuple[list, list]:
-    n_steps = env._n - COINT_WINDOW
-    env._episode_length = n_steps
-    obs, _ = env.reset(options={"episode_start": COINT_WINDOW})
-
-    daily_pnl  = []
-    trades     = []
-    open_trade = None
-
-    step = -1
-    for step in range(n_steps):
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, _, info = env.step(int(action))
-        daily_pnl.append(reward)
-
-        date = env.dates[min(COINT_WINDOW + step, env._n - 1)]
-
-        if open_trade is None and env.position != 0:
-            open_trade = {
-                "entry_date":   date,
-                "direction":    "long" if env.position == 1 else "short",
-                "entry_spread": env.entry_spread,
-            }
-
-        if open_trade is not None and env.position == 0:
-            sign = 1 if open_trade["direction"] == "long" else -1
-            pnl  = (info["spread"] - open_trade["entry_spread"]) * sign
-            trades.append({**open_trade, "exit_date": date, "pnl": round(pnl, 4)})
-            open_trade = None
-
-        if terminated:
-            break
-
-    if open_trade is not None:
-        last_idx = min(COINT_WINDOW + step, env._n - 1)
-        sign     = 1 if open_trade["direction"] == "long" else -1
-        pnl      = (env._spread[last_idx] - open_trade["entry_spread"]) * sign
-        trades.append({
-            **open_trade,
-            "exit_date": env.dates[last_idx],
-            "pnl":       round(float(pnl), 4),
-        })
-
+    """Realized P&L and closed trades over the OOS window (shared loop)."""
+    steps, trades = run_episode(model, env)
+    daily_pnl = [s["pnl"] for s in steps]
     return daily_pnl, trades
 
 
@@ -192,12 +170,13 @@ def main():
         hedge  = best["hedge_ratio"]
         print(f"         best pair {t1}/{t2}  p={best['pvalue']:.4f}  hedge={hedge:.4f}")
 
-        # Train — episode spans full training window minus lookback
+        # Train — short episodes with randomized starts inside the train window
         train_env = make_env(all_prices, t1, t2, hedge,
                              start_i, end_train_i,
-                             episode_length=TRAIN_DAYS - COINT_WINDOW)
+                             episode_length=TRAIN_EPISODE_LEN)
         model = PPO("MlpPolicy", train_env,
-                    n_steps=2048, batch_size=64, ent_coef=0.02, verbose=0)
+                    n_steps=2048, batch_size=64, ent_coef=0.02,
+                    seed=SEED, verbose=0)
         model.learn(total_timesteps=TIMESTEPS)
         print(f"         trained {TIMESTEPS:,} steps")
 
@@ -210,7 +189,8 @@ def main():
         sharpe, n_trades, wr = oos_stats(daily_pnl, trades)
 
         for tr in trades:
-            all_trades.append({**tr, "fold": fold_i + 1, "pair": f"{t1}/{t2}"})
+            all_trades.append({**tr, "pnl": round(tr["pnl"], 4),
+                               "fold": fold_i + 1, "pair": f"{t1}/{t2}"})
 
         wr_pct = f"{wr:.0%}" if not np.isnan(wr) else "n/a"
         print(f"         oos → sharpe={sharpe:.3f}  trades={n_trades}  winrate={wr_pct}\n")

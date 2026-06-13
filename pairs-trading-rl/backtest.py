@@ -1,10 +1,19 @@
+import argparse
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from env import PairsTradingEnv, COINT_WINDOW
+from env import PairsTradingEnv, COST_BPS
+from evaluate import run_episode
+
+# Print UTF-8 so decorative characters don't crash on Windows when redirected.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
 MODEL_PATH   = "models/pairs_ppo_GLD_RTX.zip"
 OOS_START    = "2025-01-01"
@@ -13,106 +22,45 @@ EQUITY_PNG   = "backtest_equity.png"
 TRADES_CSV   = "backtest_trades.csv"
 
 
-def run_backtest():
-    # Build OOS env — episode spans all data after the lookback window
-    env = PairsTradingEnv(start_date=OOS_START, end_date=OOS_END)
-    n_steps = env._n - COINT_WINDOW
-    env._episode_length = n_steps
+def run_backtest(model_path, ticker1, ticker2, start, end, cost_bps=COST_BPS):
+    env   = PairsTradingEnv(start_date=start, end_date=end,
+                            ticker1=ticker1, ticker2=ticker2, cost_bps=cost_bps)
+    model = PPO.load(model_path, env=env)
 
-    model = PPO.load(MODEL_PATH, env=env)
-
-    obs, _ = env.reset(options={"episode_start": COINT_WINDOW})
-
-    equity       = [0.0]
-    daily_pnl    = []
-    trades       = []
-
-    # Track open trade
-    open_trade = None  # {"entry_date", "direction", "entry_spread"}
-
-    step = -1
-    for step in range(n_steps):
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, _, info = env.step(int(action))
-
-        daily_pnl.append(reward)
-        equity.append(equity[-1] + reward)
-
-        data_idx = COINT_WINDOW + step
-        date     = env.dates[data_idx]
-        pos      = info["position"]
-
-        # Detect open
-        if open_trade is None and env.position != 0:
-            open_trade = {
-                "entry_date": date,
-                "direction":  "long" if env.position == 1 else "short",
-                "entry_spread": env.entry_spread,
-            }
-
-        # Detect close: position just went to 0 while we had an open trade
-        if open_trade is not None and env.position == 0:
-            # Realized P&L is embedded in reward when a close happened;
-            # recompute cleanly from spread delta
-            exit_spread = info["spread"]
-            sign = 1 if open_trade["direction"] == "long" else -1
-            pnl  = (exit_spread - open_trade["entry_spread"]) * sign
-            trades.append({
-                "entry_date":  open_trade["entry_date"],
-                "exit_date":   date,
-                "direction":   open_trade["direction"],
-                "pnl":         round(pnl, 4),
-            })
-            open_trade = None
-
-        if terminated:
-            break
-
-    # Close any trade still open at end of period
-    if open_trade is not None:
-        last_idx    = min(COINT_WINDOW + step, env._n - 1)
-        exit_spread = env._spread[last_idx]
-        sign = 1 if open_trade["direction"] == "long" else -1
-        pnl  = (exit_spread - open_trade["entry_spread"]) * sign
-        trades.append({
-            "entry_date": open_trade["entry_date"],
-            "exit_date":  env.dates[last_idx],
-            "direction":  open_trade["direction"],
-            "pnl":        round(pnl, 4),
-        })
-
-    return equity, daily_pnl, trades, env.dates[COINT_WINDOW: COINT_WINDOW + len(equity) - 1]
+    steps, trades = run_episode(model, env)
+    daily_pnl = [s["pnl"] for s in steps]
+    dates     = [s["date"] for s in steps]
+    equity    = np.cumsum(daily_pnl)  # cumulative net P&L, in spread units
+    return equity, daily_pnl, trades, dates
 
 
 def compute_stats(trades, daily_pnl):
-    df = pd.DataFrame(trades)
+    arr = np.asarray(daily_pnl, dtype=float)
 
-    total_trades = len(df)
-    win_rate     = (df["pnl"] > 0).mean() if total_trades else 0.0
+    total_trades = len(trades)
+    win_rate = (np.mean([t["pnl"] > 0 for t in trades])
+                if total_trades else 0.0)
 
-    arr = np.array(daily_pnl)
     sharpe = (arr.mean() / arr.std() * np.sqrt(252)) if arr.std() > 0 else 0.0
+    total_pnl = float(arr.sum())
 
-    # Max drawdown from equity curve
     equity = np.cumsum(arr)
-    peak   = np.maximum.accumulate(equity)
-    dd     = equity - peak
-    max_dd = float(dd.min())
+    peak   = np.maximum.accumulate(equity) if len(equity) else np.array([0.0])
+    max_dd = float((equity - peak).min()) if len(equity) else 0.0
 
-    return total_trades, win_rate, sharpe, max_dd
+    return total_trades, win_rate, sharpe, max_dd, total_pnl
 
 
-def plot_equity(equity, dates):
+def plot_equity(equity, dates, ticker1, ticker2):
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(dates[:len(equity)], equity, linewidth=1.5, color="#2196F3")
+    ax.plot(dates, equity, linewidth=1.5, color="#2196F3")
     ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-    ax.fill_between(dates[:len(equity)], equity, 0,
-                    where=[e >= 0 for e in equity], alpha=0.15, color="#4CAF50")
-    ax.fill_between(dates[:len(equity)], equity, 0,
-                    where=[e < 0 for e in equity],  alpha=0.15, color="#F44336")
-    ax.set_title("GLD/RTX Pairs Trading — Out-of-Sample Equity Curve (2025–2026)", fontsize=13)
+    ax.fill_between(dates, equity, 0, where=equity >= 0, alpha=0.15, color="#4CAF50")
+    ax.fill_between(dates, equity, 0, where=equity < 0,  alpha=0.15, color="#F44336")
+    ax.set_title(f"{ticker1}/{ticker2} Pairs Trading — Out-of-Sample Equity Curve",
+                 fontsize=13)
     ax.set_xlabel("Date")
-    ax.set_ylabel("Cumulative P&L (spread units)")
+    ax.set_ylabel("Cumulative P&L (spread units, net of costs)")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(EQUITY_PNG, dpi=150)
@@ -120,28 +68,38 @@ def plot_equity(equity, dates):
 
 
 def main():
-    print(f"Loading model: {MODEL_PATH}")
-    print(f"OOS window:    {OOS_START}  →  {OOS_END}\n")
+    parser = argparse.ArgumentParser(description="Out-of-sample backtest of a trained pairs model.")
+    parser.add_argument("--model",   default=MODEL_PATH)
+    parser.add_argument("--ticker1", default="GLD")
+    parser.add_argument("--ticker2", default="RTX")
+    parser.add_argument("--start",   default=OOS_START)
+    parser.add_argument("--end",     default=OOS_END)
+    parser.add_argument("--cost-bps", default=COST_BPS, type=float,
+                        help="Per-side transaction cost as a fraction of notional")
+    args = parser.parse_args()
 
-    equity, daily_pnl, trades, dates = run_backtest()
+    print(f"Loading model: {args.model}")
+    print(f"OOS window:    {args.start}  →  {args.end}\n")
 
-    # Save trade log
-    trades_df = pd.DataFrame(trades)
-    trades_df.to_csv(TRADES_CSV, index=False)
+    equity, daily_pnl, trades, dates = run_backtest(
+        args.model, args.ticker1, args.ticker2, args.start, args.end, args.cost_bps)
 
-    # Plot
-    plot_equity(equity[1:], dates)
+    pd.DataFrame(trades).to_csv(TRADES_CSV, index=False)
+    plot_equity(np.asarray(equity), dates, args.ticker1, args.ticker2)
     print(f"Equity curve saved → {EQUITY_PNG}")
+    print(f"Trade log saved    → {TRADES_CSV}")
 
-    # Stats
-    total_trades, win_rate, sharpe, max_dd = compute_stats(trades, daily_pnl)
+    total_trades, win_rate, sharpe, max_dd, total_pnl = compute_stats(trades, daily_pnl)
 
-    print("\n── Backtest Summary ─────────────────────────")
-    print(f"  Total trades  : {total_trades}")
-    print(f"  Win rate      : {win_rate:.1%}")
-    print(f"  Sharpe ratio  : {sharpe:.4f}")
-    print(f"  Max drawdown  : {max_dd:.4f}")
-    print("─────────────────────────────────────────────")
+    print("\n── Backtest Summary (realized P&L, net of costs) ──")
+    print(f"  Total trades   : {total_trades}")
+    print(f"  Win rate       : {win_rate:.1%}")
+    print(f"  Total P&L      : {total_pnl:.4f}  (spread units)")
+    print(f"  Sharpe (ann.)  : {sharpe:.4f}")
+    print(f"  Max drawdown   : {max_dd:.4f}")
+    print("───────────────────────────────────────────────────")
+    if total_trades < 30:
+        print("  NOTE: very few trades — Sharpe/win-rate are not statistically reliable.")
 
 
 if __name__ == "__main__":
