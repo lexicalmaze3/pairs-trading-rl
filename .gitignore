@@ -4,6 +4,10 @@ __pycache__/
 *.png
 *.csv
 
+# Bundled quickstart assets are tracked despite the *.png / *.csv rules above.
+!sample_data/pair_sample.csv
+!quickstart_output.png
+
 # Generated models are ignored, except the bundled demo model.
 models/*
 !models/pairs_ppo_GLD_RTX.zip
